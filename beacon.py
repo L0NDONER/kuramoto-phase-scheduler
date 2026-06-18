@@ -26,9 +26,10 @@ MCAST_GRP   = "239.0.0.1"
 MCAST_PORT  = 7400
 TICK_S      = 0.05          # 20 Hz
 
-OMEGA = {"mint": 0.048, "pi": 0.060}
+OMEGA = {"mint": 0.052, "pi": 0.056, "pi2": 0.054}
 NOISE       = 0.008
-ANTI_THRESH = 0.25          # rad from π → considered locked (simple check)
+PHASE_TARGET = 3.0          # natural lock point for this Δω/K ratio
+ANTI_THRESH  = 0.20         # rad from target → considered locked (simple check)
 LOCK_WINDOW = 20            # ticks of history for statistical lock detection
 LOCK_STD    = 0.10          # max phase std to count as statistically locked
 REMOTE_TIMEOUT = 0.5        # seconds before entering free-run mode
@@ -44,7 +45,7 @@ DRAIN_TICKS    = 4          # base ticks to hold burst open (~200ms)
 # Beacon struct: magic(H) sender(B) tick(I) theta(f) omega(f) + pad = 16 bytes
 MAGIC      = 0x1B4A
 FMT        = "!HBIff x"
-SENDER_ID  = {"mint": 0, "pi": 1}
+SENDER_ID  = {"mint": 0, "pi": 1, "pi2": 2}
 
 # ------------------------------------
 # TC SHIM — threaded subprocess (non-blocking tick loop)
@@ -114,11 +115,12 @@ def run(role):
     omega      = OMEGA[role]
     tick       = 0
 
-    remote_theta      = None
-    remote_tick_seen  = -1
-    last_remote_theta = None
-    last_remote_tick  = -1
-    last_beacon_time  = None
+    n_peers = len(SENDER_ID) - 1
+    remote_theta      = {}   # peer_id -> latest theta
+    remote_tick_seen  = {}   # peer_id -> latest tick
+    last_remote_theta = {}
+    last_remote_tick  = {}
+    last_beacon_time  = {}
     omega_error       = 0.0
 
     phase_history  = deque(maxlen=LOCK_WINDOW)
@@ -142,25 +144,25 @@ def run(role):
             while True:
                 data, addr = rx.recvfrom(64)
                 parsed = unpack_beacon(data)
-                if parsed and parsed[0] == remote_id:
-                    _, rtick, rtheta, _ = parsed
-                    if rtick > remote_tick_seen:
-                        # frequency tracking
-                        if last_remote_theta is not None and rtick > last_remote_tick:
-                            dt       = rtick - last_remote_tick
-                            measured = ((rtheta - last_remote_theta + math.pi) % (2 * math.pi) - math.pi) / dt
+                if parsed and parsed[0] != own_id:
+                    pid, rtick, rtheta, _ = parsed
+                    if rtick > remote_tick_seen.get(pid, -1):
+                        if pid in last_remote_theta and rtick > last_remote_tick.get(pid, -1):
+                            dt       = rtick - last_remote_tick[pid]
+                            measured = ((rtheta - last_remote_theta[pid] + math.pi) % (2 * math.pi) - math.pi) / dt
                             omega_error = 0.9 * omega_error + 0.1 * (measured - omega)
-                            omega       = max(0.01, omega + omega_error * 0.01)
-                        last_remote_theta = rtheta
-                        last_remote_tick  = rtick
-                        last_beacon_time  = time.monotonic()
-                        remote_theta      = rtheta
-                        remote_tick_seen  = rtick
+                            omega       = max(0.01, omega + omega_error * 0.001)
+                        last_remote_theta[pid] = rtheta
+                        last_remote_tick[pid]  = rtick
+                        last_beacon_time[pid]  = time.monotonic()
+                        remote_theta[pid]      = rtheta
+                        remote_tick_seen[pid]  = rtick
         except BlockingIOError:
             pass
 
-        # --- graceful degradation: free-run if remote gone ---
-        remote_alive = last_beacon_time is not None and (time.monotonic() - last_beacon_time) < REMOTE_TIMEOUT
+        # --- graceful degradation: free-run if no remotes alive ---
+        now = time.monotonic()
+        remote_alive = any((now - t) < REMOTE_TIMEOUT for t in last_beacon_time.values())
         if not remote_alive:
             theta = (theta + omega) % (2 * math.pi)
             pkt = pack_beacon(own_id, tick, theta, omega)
@@ -173,19 +175,28 @@ def run(role):
                 time.sleep(wait)
             continue
 
-        # --- Kuramoto step ---
-        diff        = remote_theta - theta
-        error       = abs((diff + math.pi) % (2 * math.pi) - math.pi)
-        k           = min(0.05, 0.01 + error * 0.1)
-        noise       = random.gauss(0, NOISE)
-        dtheta      = omega - k * math.sin(diff) + noise
-        theta       = (theta + dtheta) % (2 * math.pi)
+        # --- Kuramoto step (sum over all live peers) ---
+        now = time.monotonic()
+        live_peers = [pid for pid, t in last_beacon_time.items() if (now - t) < REMOTE_TIMEOUT]
+        # pi2 couples to mint only — coupling to anti-phase mint+pi pair cancels to zero
+        if own_id == 2 and 0 in live_peers:
+            live_peers = [0]
+        coupling = sum(math.sin(remote_theta[pid] - theta) for pid in live_peers)
+        # phase_diff vs first live peer for lock/display
+        ref_pid    = live_peers[0]
+        diff       = remote_theta[ref_pid] - theta
+        phase_diff = abs((diff + math.pi) % (2 * math.pi) - math.pi)
+        error      = abs(phase_diff - PHASE_TARGET)
+        k          = max(0.12, min(0.16, 0.12 + error * 0.1))
+        noise      = random.gauss(0, NOISE)
+        dtheta     = omega - k * coupling + noise
+        theta      = (theta + dtheta) % (2 * math.pi)
 
         # --- statistical lock detection ---
-        phase_diff = abs((remote_theta - theta + math.pi) % (2 * math.pi) - math.pi)
+        phase_diff = abs((remote_theta[ref_pid] - theta + math.pi) % (2 * math.pi) - math.pi)
         phase_history.append(phase_diff)
         if len(phase_history) >= LOCK_WINDOW // 2:
-            locked = statistics.stdev(phase_history) < LOCK_STD and phase_diff > (math.pi - ANTI_THRESH)
+            locked = statistics.stdev(phase_history) < LOCK_STD and abs(phase_diff - PHASE_TARGET) < ANTI_THRESH
         else:
             locked = False
 
@@ -196,7 +207,7 @@ def run(role):
                 if drain_ttl == 0:
                     drain_count += 1
                     # wider window when farther from π, tighter when close
-                    drain_ttl = int(DRAIN_TICKS * (1 + abs(phase_diff - math.pi) / math.pi))
+                    drain_ttl = int(DRAIN_TICKS * (1 + abs(phase_diff - PHASE_TARGET) / math.pi))
                     open_drain()
             prev_theta_mod = curr_mod
 
@@ -231,11 +242,25 @@ def run(role):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in ("mint", "pi"):
+    import os, atexit
+    if len(sys.argv) != 2 or sys.argv[1] not in ("mint", "pi", "pi2"):
         print("usage: python3 beacon.py mint|pi")
         sys.exit(1)
+    role = sys.argv[1]
+    PIDFILE = f"/tmp/beacon-{role}.pid"
+    if os.path.exists(PIDFILE):
+        try:
+            existing = int(open(PIDFILE).read())
+            os.kill(existing, 0)
+            print(f"beacon.py {role} already running (pid {existing}) — refusing to start")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(os.unlink, PIDFILE)
     try:
-        run(sys.argv[1])
+        run(role)
     finally:
-        if sys.argv[1] == "pi":
+        if role == "pi":
             close_drain()
