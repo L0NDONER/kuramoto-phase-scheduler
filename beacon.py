@@ -26,7 +26,7 @@ MCAST_GRP   = "239.0.0.1"
 MCAST_PORT  = 7400
 TICK_S      = 0.05          # 20 Hz
 
-OMEGA = {"mint": 0.052, "pi": 0.056, "pi2": 0.054}
+OMEGA = {"mint": 0.052, "pi": 0.056, "pi2": 0.052}
 NOISE       = 0.008
 PHASE_TARGET = 3.0          # natural lock point for this Δω/K ratio
 ANTI_THRESH  = 0.20         # rad from target → considered locked (simple check)
@@ -147,14 +147,20 @@ def run(role):
                 if parsed and parsed[0] != own_id:
                     pid, rtick, rtheta, _ = parsed
                     if rtick > remote_tick_seen.get(pid, -1):
+                        now_r = time.monotonic()
                         if pid in last_remote_theta and rtick > last_remote_tick.get(pid, -1):
                             dt       = rtick - last_remote_tick[pid]
-                            measured = ((rtheta - last_remote_theta[pid] + math.pi) % (2 * math.pi) - math.pi) / dt
-                            omega_error = 0.9 * omega_error + 0.1 * (measured - omega)
-                            omega       = max(0.01, omega + omega_error * 0.001)
+                            wall_dt  = now_r - last_beacon_time.get(pid, now_r)
+                            expected = dt * 0.05  # ticks × 50ms
+                            # skip if peer's beacon interval deviates >30% — tick jitter under load
+                            if dt > 0 and abs(wall_dt - expected) / expected < 0.30:
+                                measured = ((rtheta - last_remote_theta[pid] + math.pi) % (2 * math.pi) - math.pi) / dt
+                                omega_error = 0.9 * omega_error + 0.1 * (measured - omega)
+                                gain     = 0.0002 if role == "pi2" else 0.001
+                                omega    = max(0.01, omega + omega_error * gain)
                         last_remote_theta[pid] = rtheta
                         last_remote_tick[pid]  = rtick
-                        last_beacon_time[pid]  = time.monotonic()
+                        last_beacon_time[pid]  = now_r
                         remote_theta[pid]      = rtheta
                         remote_tick_seen[pid]  = rtick
         except BlockingIOError:
