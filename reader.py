@@ -14,6 +14,7 @@ import struct
 import subprocess
 import time
 import math
+import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,7 +23,7 @@ MCAST_PORT   = 7400
 MAGIC        = 0x1B4A
 FMT          = "!HBIff x"
 
-PHASE_TARGET = 3.0
+PHASE_TARGET = math.pi      # true anti-phase target
 ANTI_THRESH  = 0.20
 LOCK_WINDOW  = 20
 LOCK_STD     = 0.10
@@ -30,7 +31,7 @@ LOCK_STD     = 0.10
 TC_BIN       = "/usr/sbin/tc"
 TC_DEV       = "enp0s31f6"
 TC_CLASS     = "1:20"
-TC_RATE      = "5mbit"
+TC_RATE      = "20mbit"
 TC_BURST_IDLE  = "64k"
 TC_BURST_DRAIN = "500k"
 
@@ -47,11 +48,9 @@ def _tc_run(burst):
         print(f"\n[tc] {e}", flush=True)
 
 def open_drain():
-    def _drain():
-        _tc_run(TC_BURST_DRAIN)
-        time.sleep(0.20)
-        _tc_run(TC_BURST_IDLE)
-    _pool.submit(_drain)
+    _tc_run(TC_BURST_DRAIN)
+    time.sleep(0.20)
+    _tc_run(TC_BURST_IDLE)
 
 def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -89,7 +88,6 @@ def main():
             if len(history) > LOCK_WINDOW:
                 history.pop(0)
 
-            import statistics
             locked = (len(history) >= LOCK_WINDOW and
                       statistics.stdev(history) < LOCK_STD and
                       abs(phase_diff - PHASE_TARGET) < ANTI_THRESH)

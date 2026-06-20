@@ -28,7 +28,7 @@ TICK_S      = 0.05          # 20 Hz
 
 OMEGA = {"mint": 0.052, "pi": 0.056, "pi2": 0.052}
 NOISE       = 0.008
-PHASE_TARGET = 3.0          # natural lock point for this Δω/K ratio
+PHASE_TARGET = math.pi      # true anti-phase target
 ANTI_THRESH  = 0.20         # rad from target → considered locked (simple check)
 LOCK_WINDOW = 20            # ticks of history for statistical lock detection
 LOCK_STD    = 0.10          # max phase std to count as statistically locked
@@ -193,7 +193,7 @@ def run(role):
         diff       = remote_theta[ref_pid] - theta
         phase_diff = abs((diff + math.pi) % (2 * math.pi) - math.pi)
         error      = abs(phase_diff - PHASE_TARGET)
-        k          = max(0.12, min(0.16, 0.12 + error * 0.1))
+        k          = max(0.135, min(0.18, 0.135 + error * 0.1))
         noise      = random.gauss(0, NOISE)
         dtheta     = omega - k * coupling + noise
         theta      = (theta + dtheta) % (2 * math.pi)

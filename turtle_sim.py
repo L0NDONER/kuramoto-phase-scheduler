@@ -13,10 +13,10 @@ import traceback as _tb
 
 OMEGA_MINT   = 0.048
 OMEGA_PI     = 0.060
-K            = 0.040   # tuned: π − arcsin(Δω/2K) ≈ 2.99
-NOISE        = 0.003
-PHASE_TARGET = 3.0
-ANTI_THRESH  = 0.15
+K            = 0.20
+NOISE        = 0.001
+PHASE_TARGET = math.pi
+ANTI_THRESH  = 0.031   # 1% of π
 
 ORBIT_R     = 160
 TRACE_X     = 0
@@ -95,12 +95,12 @@ link = make_pen("white", 2)
 FS_X, FS_Y = 0, 60
 
 fs_dot = turtle.Turtle(shape="circle")
-fs_dot.penup(); fs_dot.shapesize(1.8); fs_dot.color("tomato")
+fs_dot.penup(); fs_dot.shapesize(2.5); fs_dot.color("tomato")
 fs_dot.goto(FS_X, FS_Y)
 
 fs_lbl = make_pen("tomato")
 fs_lbl.goto(FS_X, FS_Y - 24)
-fs_lbl.write("Firestick", align="center", font=("Arial", 10, "bold"))
+fs_lbl.write("Firestick / GPU", align="center", font=("Arial", 10, "bold"))
 fs_pulse = make_pen("white", 1)
 
 for name, angle, col in [("Mint", 90, "cyan"), ("Pi", 270, "orange")]:
@@ -174,18 +174,26 @@ while True:
         prev_pd    = abs((diff + math.pi) % (2 * math.pi) - math.pi)
         noise = NOISE
         if not live_mint:
-            theta_mint = (theta_mint + OMEGA_MINT - K * math.sin(diff) + random.gauss(0, noise)) % (2 * math.pi)
+            theta_mint = (theta_mint + OMEGA_MINT + K * math.sin(diff) + random.gauss(0, noise)) % (2 * math.pi)
         if not live_pi:
-            theta_pi   = (theta_pi   + OMEGA_PI   - K * math.sin(-diff) + random.gauss(0, noise)) % (2 * math.pi)
+            theta_pi   = (theta_pi   + OMEGA_PI   + K * math.sin(-diff) + random.gauss(0, noise)) % (2 * math.pi)
 
-    phase_diff  = abs((theta_pi - theta_mint + math.pi) % (2 * math.pi) - math.pi)
-    antiphasing = abs(phase_diff - PHASE_TARGET) < ANTI_THRESH
+    raw_pd     = (theta_pi - theta_mint)
+    pd_err     = math.atan2(math.sin(raw_pd - math.pi), math.cos(raw_pd - math.pi))
+    phase_diff = abs(pd_err)
+    antiphasing = phase_diff > math.pi - ANTI_THRESH
 
-    # --- draw oscillators ---
-    mx = ORBIT_R * math.cos(theta_mint)
-    my = ORBIT_R * math.sin(theta_mint)
-    px = ORBIT_R * math.cos(theta_pi)
-    py = ORBIT_R * math.sin(theta_pi)
+    # --- draw oscillators in phase space ---
+    # Mint at +phase_diff/2, Pi at -phase_diff/2 around the anti-phase axis
+    base_angle = 0.0
+
+    mint_angle = base_angle + phase_diff / 2
+    pi_angle   = base_angle - phase_diff / 2
+
+    mx = ORBIT_R * math.cos(mint_angle)
+    my = ORBIT_R * math.sin(mint_angle)
+    px = ORBIT_R * math.cos(pi_angle)
+    py = ORBIT_R * math.sin(pi_angle)
 
     mint_dot.goto(mx, my + 60)
     pi_dot.goto(px, py + 60)
@@ -201,9 +209,11 @@ while True:
     if live_pi:   pi_dot.shapesize(3.0)
     else:         pi_dot.shapesize(2.5)
 
-    # --- connecting line ---
+    # --- spokes: Firestick hub → each oscillator ---
     link.clear()
-    link.goto(mx, my + 60); link.pendown()
+    link.goto(FS_X, FS_Y); link.pendown()
+    link.goto(mx, my + 60); link.penup()
+    link.goto(FS_X, FS_Y); link.pendown()
     link.goto(px, py + 60); link.penup()
 
     # --- Firestick drain ---
@@ -244,10 +254,10 @@ while True:
     prev_tx = prev_ty = None
     for j, (pd, r) in enumerate(phase_history):
         tx = TRACE_X - TRACE_W + (j / HISTORY) * TRACE_W * 2
-        ty = TRACE_Y + (pd / math.pi) * TRACE_H * 1.8
+        ty = TRACE_Y + (pd / math.pi) * (TRACE_H - 4)   # pd=π lands on antiy
         ty = max(TRACE_Y - TRACE_H + 2, min(TRACE_Y + TRACE_H - 2, ty))
         w  = max(1, int(1 + 5 * (r / max_rate))) if max_rate > 0 else 1
-        col = ((0.3, 0.4, 1.0) if abs(pd - PHASE_TARGET) < ANTI_THRESH else
+        col = ((0.3, 0.4, 1.0) if pd > math.pi - ANTI_THRESH else
                (0.2, 0.8, 0.2))
         if prev_tx is None:
             trace_pen.goto(tx, ty)
