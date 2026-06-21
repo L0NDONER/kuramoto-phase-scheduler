@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -89,6 +90,7 @@ static float ntohf(float f) { return htonf(f); } /* same op */
 
 int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    signal(SIGCHLD, SIG_IGN);
 
     if (argc < 2 || (strcmp(argv[1], "pi") && strcmp(argv[1], "pi2"))) {
         fprintf(stderr, "usage: beacon <pi|pi2>\n");
@@ -99,7 +101,7 @@ int main(int argc, char *argv[]) {
     uint8_t sid = is_pi2 ? 2 : 1;
     double omega = is_pi2 ? OMEGA_PI2 : OMEGA_PI;
 
-    srand((unsigned)time(NULL) ^ getpid());
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
     /* TX socket */
     int tx = socket(AF_INET, SOCK_DGRAM, 0);

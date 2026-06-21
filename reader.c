@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -68,6 +69,7 @@ static void drain_async(void) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    signal(SIGCHLD, SIG_IGN);  /* auto-reap drain_async children */
 
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
