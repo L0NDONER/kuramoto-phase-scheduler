@@ -26,7 +26,7 @@ MCAST_GRP   = "239.0.0.1"
 MCAST_PORT  = 7400
 TICK_S      = 0.05          # 20 Hz
 
-OMEGA = {"mint": 0.052, "pi": 0.056, "pi2": 0.052}
+OMEGA = {"mint": 0.052, "pi": 0.054, "pi2": 0.052}
 NOISE       = 0.008
 PHASE_TARGET = math.pi      # true anti-phase target
 ANTI_THRESH  = 0.20         # rad from target → considered locked (simple check)
@@ -127,6 +127,7 @@ def run(role):
     prev_theta_mod = None
     drain_ttl      = 0
     drain_count    = 0
+    integral       = 0.0   # PI integral term — persistent across loop
 
     tx = make_sender()
     rx = make_receiver(own_id)
@@ -192,8 +193,8 @@ def run(role):
         ref_pid    = live_peers[0]
         diff       = remote_theta[ref_pid] - theta
         phase_diff = abs((diff + math.pi) % (2 * math.pi) - math.pi)
-        error      = abs(phase_diff - PHASE_TARGET)
-        k          = max(0.135, min(0.18, 0.135 + error * 0.1))
+        signed_error = phase_diff - PHASE_TARGET   # negative if under π, positive if over
+        k          = max(0.22, min(0.28, 0.22 + abs(signed_error) * 0.1 + integral * 0.000005))
         noise      = random.gauss(0, NOISE)
         dtheta     = omega - k * coupling + noise
         theta      = (theta + dtheta) % (2 * math.pi)
@@ -205,6 +206,10 @@ def run(role):
             locked = statistics.stdev(phase_history) < LOCK_STD and abs(phase_diff - PHASE_TARGET) < ANTI_THRESH
         else:
             locked = False
+
+        # --- PI integral (signed — corrects in both directions) ---
+        if locked:
+            integral = max(-0.5, min(0.5, integral + signed_error * TICK_S * 0.00005))
 
         # --- adaptive drain window (Pi only) ---
         if is_pi and locked:
@@ -236,7 +241,7 @@ def run(role):
         bar      = int(phase_diff / math.pi * 40)
         status   = "LOCKED" if locked else "      "
         drain_str = f"  drains={drain_count}" if is_pi else ""
-        print(f"\r[{role}] tick={tick:5d}  φ={phase_diff:.3f}  {'█'*bar}{'░'*(40-bar)}  {status}{drain_str}   ", end="", flush=True)
+        print(f"\r[{role}] tick={tick:5d}  φ={phase_diff:.3f}  {'█'*bar}{'░'*(40-bar)}  {status}  k={k:.4f}  ∫={integral:.4f}{drain_str}   ", end="", flush=True)
 
         tick += 1
 
