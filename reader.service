@@ -1,0 +1,13 @@
+[Unit]
+Description=Kuramoto phase reader — tc drain coordinator
+After=network.target
+
+[Service]
+ExecStart=/home/martin/claude/reader
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
