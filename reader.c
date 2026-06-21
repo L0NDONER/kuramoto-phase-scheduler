@@ -80,6 +80,27 @@ static float htonf(float f) {
 
 static void tc_run(const char *cmd) { int r = system(cmd); (void)r; }
 
+static uint64_t read_tx_bytes(void) {
+    FILE *f = fopen("/proc/net/dev", "r");
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, TC_DEV)) {
+            /* fields: iface rx_bytes ... (8 rx fields) tx_bytes ... */
+            char iface[32]; uint64_t v[16];
+            if (sscanf(line, " %31[^:]: %lu %lu %lu %lu %lu %lu %lu %lu "
+                              "%lu %lu %lu %lu %lu %lu %lu %lu",
+                       iface, &v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],
+                       &v[8],&v[9],&v[10],&v[11],&v[12],&v[13],&v[14],&v[15]) == 17) {
+                fclose(f);
+                return v[8];  /* tx_bytes is 9th value (index 8) */
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
 static void tc_setup(void) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
@@ -149,6 +170,8 @@ int main(int argc, char **argv) {
 
     double phases[3] = {-1.0, -1.0, -1.0};  /* index 1=Pi, 2=Pi2 */
     struct timespec last_seen[3] = {{0},{0},{0}};
+    uint64_t prev_tx_bytes = 0;
+    struct timespec prev_tx_ts = {0};
     double history[LOCK_WINDOW];
     int    hist_n = 0, hist_full = 0;
     double prev_diff = -1.0;
@@ -234,11 +257,26 @@ int main(int argc, char **argv) {
         }
         prev_diff = phase_diff;
 
+        /* TX rate */
+        double tx_mbps = 0.0;
+        {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t tx = read_tx_bytes();
+            if (prev_tx_bytes && prev_tx_ts.tv_sec) {
+                double dt = (now.tv_sec - prev_tx_ts.tv_sec)
+                          + (now.tv_nsec - prev_tx_ts.tv_nsec) * 1e-9;
+                if (dt > 0.0) tx_mbps = (double)(tx - prev_tx_bytes) * 8.0 / 1e6 / dt;
+            }
+            prev_tx_bytes = tx;
+            prev_tx_ts    = now;
+        }
+
         int bar = (int)(phase_diff / M_PI * 39);
         printf("\r[reader] φ=%.3f  ", phase_diff);
         for (int i=0;i<bar;i++) printf("█");
         for (int i=bar;i<40;i++) printf("░");
-        printf("  %s  drains=%d   ", locked ? "LOCKED" : "      ", drains);
+        printf("  %s  drains=%d  up=%.1fMbps   ",
+               locked ? "LOCKED" : "      ", drains, tx_mbps);
         fflush(stdout);
     }
 }
