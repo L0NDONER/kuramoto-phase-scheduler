@@ -50,12 +50,26 @@ static float ntohf(float f) {
     float r; memcpy(&r, &n, 4); return r;
 }
 
+static void tc_run(const char *cmd) { int r = system(cmd); (void)r; }
+
+static void tc_setup(void) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "%s qdisc replace dev %s root handle 1: htb default 20",
+             TC_BIN, TC_DEV);
+    tc_run(cmd);
+    snprintf(cmd, sizeof(cmd),
+             "%s class replace dev %s parent 1: classid %s htb rate %s burst 64k",
+             TC_BIN, TC_DEV, TC_CLASS, TC_RATE);
+    tc_run(cmd);
+}
+
 static void tc_burst(const char *burst) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
              "%s class change dev %s classid %s htb rate %s burst %s",
              TC_BIN, TC_DEV, TC_CLASS, TC_RATE, burst);
-    (void)system(cmd);
+    tc_run(cmd);
 }
 
 static void drain_async(void) {
@@ -91,6 +105,7 @@ int main(void) {
     double prev_diff = -1.0;
     int    drains = 0;
 
+    tc_setup();
     memset(history, 0, sizeof(history));
     printf("[reader] passive — listening to Pi(1) + Pi2(2)\n");
 
