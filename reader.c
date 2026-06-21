@@ -87,7 +87,7 @@ static void tc_setup(void) {
              TC_BIN, TC_DEV);
     tc_run(cmd);
     snprintf(cmd, sizeof(cmd),
-             "%s class replace dev %s parent 1: classid %s htb rate %s burst 64k",
+             "%s class replace dev %s parent 1: classid %s htb rate %s burst 64k quantum 1514",
              TC_BIN, TC_DEV, TC_CLASS, TC_RATE);
     tc_run(cmd);
 }
@@ -95,7 +95,7 @@ static void tc_setup(void) {
 static void tc_burst(const char *burst) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-             "%s class change dev %s classid %s htb rate %s burst %s",
+             "%s class change dev %s classid %s htb rate %s burst %s quantum 1514",
              TC_BIN, TC_DEV, TC_CLASS, TC_RATE, burst);
     tc_run(cmd);
 }
