@@ -1,0 +1,13 @@
+[Unit]
+Description=Kuramoto beacon oscillator
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/beacon ROLE
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
