@@ -111,9 +111,10 @@ int main(int argc, char **argv) {
     printf("[sched] pipe=%s  port=%d  trough<%.2f  peak>%.2f\n",
            ppath, port, TROUGH_THRESH, PEAK_THRESH);
 
-    int    in_trough = 0, in_peak = 0;
-    long   cycle = 0;
-    float  prev_theta = -1.0f;
+    long  cycle = 0;
+    int   submit_armed  = 1;  /* fires next trough entry */
+    int   collect_armed = 0;  /* fires next peak entry */
+    float prev_theta = -1.0f;
 
     while (running) {
         WanPulse pkt;
@@ -133,33 +134,25 @@ int main(int argc, char **argv) {
             pipe_fd = open(ppath, O_WRONLY | O_NONBLOCK);
         }
 
-        /* detect cycle boundary: theta wrapped 2π→0 */
-        if (prev_theta > M_PI && theta < 1.0f) cycle++;
+        if (pd < MIN_PD) { prev_theta = theta; continue; }
+
+        /* SUBMIT: armed after COLLECT, fires on falling edge into trough */
+        if (submit_armed && prev_theta >= TROUGH_THRESH && theta < TROUGH_THRESH) {
+            submit_armed  = 0;
+            collect_armed = 1;
+            emit("SUBMIT ", tick, theta, pd, cycle);
+        }
+
+        /* COLLECT: armed after SUBMIT, fires on rising edge into peak (θ in π±0.30) */
+        if (collect_armed && prev_theta <= PEAK_THRESH &&
+            theta > PEAK_THRESH && theta < (float)(M_PI + 0.30)) {
+            collect_armed = 0;
+            submit_armed  = 1;
+            cycle++;
+            emit("COLLECT", tick, theta, pd, cycle);
+        }
+
         prev_theta = theta;
-
-        if (pd < MIN_PD) { in_trough = 0; in_peak = 0; continue; }
-
-        /* trough window — one SUBMIT per cycle */
-        if (theta < TROUGH_THRESH) {
-            if (!in_trough) {
-                in_trough = 1;
-                in_peak   = 0;
-                emit("SUBMIT ", tick, theta, pd, cycle);
-            }
-        } else if (theta > TROUGH_THRESH + 0.10f) {
-            in_trough = 0;  /* hysteresis before re-arm */
-        }
-
-        /* peak window — one COLLECT per cycle */
-        if (theta > PEAK_THRESH && theta < (float)(M_PI + 0.30)) {
-            if (!in_peak) {
-                in_peak   = 1;
-                in_trough = 0;
-                emit("COLLECT", tick, theta, pd, cycle);
-            }
-        } else if (theta < PEAK_THRESH - 0.10f) {
-            in_peak = 0;
-        }
     }
 
     close(fd);
