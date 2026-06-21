@@ -2,10 +2,21 @@
 /*
  * reader.c — passive Kuramoto phase reader for Mint
  *
- * Listens to Pi + Pi2 beacons. Never transmits. Never couples.
- * Detects the Pi↔Pi2 drain crossing and fires a local tc burst window.
+ * Listens to Pi + Pi2 beacons. Never transmits into the oscillator.
+ * Detects the Pi↔Pi2 drain crossing, fires a local tc burst window,
+ * and optionally sends a one-way WAN telemetry pulse on each crossing.
  *
- * Usage: sudo ./reader
+ * Usage: sudo ./reader [wan_ip] [wan_port]
+ *   wan_ip    destination for phase-crossing telemetry (optional)
+ *   wan_port  UDP port (default 7402)
+ *
+ * Telemetry packet (18 bytes, network byte order):
+ *   uint16_t magic   = 0x5257  ("RW")
+ *   uint32_t tick    — Pi1 tick at crossing
+ *   float    theta   — Pi1 phase at crossing
+ *   float    omega   — Pi1 omega at crossing
+ *   float    pd      — phase diff at crossing
+ *   uint16_t drains  — drain count
  */
 
 #include <arpa/inet.h>
@@ -26,6 +37,9 @@
 #define PORT         7400
 #define MAGIC        0x1B4A
 
+#define WAN_MAGIC     0x5257
+#define WAN_PORT_DEF  7402
+
 #define PHASE_TARGET  M_PI
 #define ANTI_THRESH   0.20
 #define LOCK_WINDOW   20
@@ -45,8 +59,22 @@ typedef struct __attribute__((packed)) {
     uint8_t  _pad;
 } Beacon;
 
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint32_t tick;
+    float    theta;
+    float    omega;
+    float    pd;
+    uint16_t drains;
+} WanPulse;
+
 static float ntohf(float f) {
     uint32_t n; memcpy(&n, &f, 4); n = ntohl(n);
+    float r; memcpy(&r, &n, 4); return r;
+}
+
+static float htonf(float f) {
+    uint32_t n; memcpy(&n, &f, 4); n = htonl(n);
     float r; memcpy(&r, &n, 4); return r;
 }
 
@@ -81,9 +109,21 @@ static void drain_async(void) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGCHLD, SIG_IGN);  /* auto-reap drain_async children */
+
+    /* optional WAN telemetry destination */
+    int wan_fd = -1;
+    struct sockaddr_in wan_addr = {0};
+    if (argc >= 2) {
+        int port = (argc >= 3) ? atoi(argv[2]) : WAN_PORT_DEF;
+        wan_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        wan_addr.sin_family      = AF_INET;
+        wan_addr.sin_port        = htons((uint16_t)port);
+        wan_addr.sin_addr.s_addr = inet_addr(argv[1]);
+        printf("[reader] WAN telemetry → %s:%d\n", argv[1], port);
+    }
 
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
@@ -104,6 +144,9 @@ int main(void) {
     int    hist_n = 0, hist_full = 0;
     double prev_diff = -1.0;
     int    drains = 0;
+    /* last seen Pi1 telemetry for WAN pulse */
+    uint32_t pi1_tick = 0;
+    float    pi1_omega = 0.0f;
 
     tc_setup();
     memset(history, 0, sizeof(history));
@@ -121,6 +164,7 @@ int main(void) {
         if (sid != 1 && sid != 2) continue;
 
         phases[sid] = ntohf(pkt.theta);
+        if (sid == 1) { pi1_tick = ntohl(pkt.tick); pi1_omega = ntohf(pkt.omega); }
 
         if (phases[1] < 0 || phases[2] < 0) continue;
 
@@ -146,6 +190,17 @@ int main(void) {
         if (prev_diff >= 0 && prev_diff > PHASE_TARGET && phase_diff <= PHASE_TARGET) {
             drain_async();
             drains++;
+            if (wan_fd >= 0) {
+                WanPulse wp;
+                wp.magic  = htons(WAN_MAGIC);
+                wp.tick   = htonl(pi1_tick);
+                wp.theta  = htonf((float)phases[1]);
+                wp.omega  = htonf(pi1_omega);
+                wp.pd     = htonf((float)phase_diff);
+                wp.drains = htons((uint16_t)drains);
+                sendto(wan_fd, &wp, sizeof(wp), 0,
+                       (struct sockaddr *)&wan_addr, sizeof(wan_addr));
+            }
         }
         prev_diff = phase_diff;
 
