@@ -125,6 +125,14 @@ int main(int argc, char **argv) {
         printf("[reader] WAN telemetry → %s:%d\n", argv[1], port);
     }
 
+    /* local phase_sched feed — always sends to 127.0.0.1:7403 */
+    int sched_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in sched_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(7403),
+        .sin_addr.s_addr = inet_addr("127.0.0.1")
+    };
+
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
     setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -186,6 +194,19 @@ int main(int argc, char **argv) {
         int locked = (hist_full &&
                       std < LOCK_STD &&
                       fabs(phase_diff - PHASE_TARGET) < ANTI_THRESH);
+
+        /* send every tick to local phase_sched on 7403 */
+        {
+            WanPulse wp;
+            wp.magic  = htons(WAN_MAGIC);
+            wp.tick   = htonl(pi1_tick);
+            wp.theta  = htonf((float)phases[1]);
+            wp.omega  = htonf(pi1_omega);
+            wp.pd     = htonf((float)phase_diff);
+            wp.drains = htons((uint16_t)drains);
+            sendto(sched_fd, &wp, sizeof(wp), 0,
+                   (struct sockaddr *)&sched_addr, sizeof(sched_addr));
+        }
 
         if (prev_diff >= 0 && prev_diff > PHASE_TARGET && phase_diff <= PHASE_TARGET) {
             drain_async();

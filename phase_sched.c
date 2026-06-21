@@ -34,7 +34,7 @@
 #include <unistd.h>
 
 #define WAN_MAGIC      0x5257
-#define WAN_PORT_DEF   7402
+#define WAN_PORT_DEF   7403
 #define PIPE_PATH_DEF  "/tmp/phase_sched"
 
 /* trough: θ < TROUGH_THRESH, peak: θ > PEAK_THRESH */
@@ -65,12 +65,12 @@ static int pipe_fd = -1;
 
 static void emit(const char *event, uint32_t tick, float theta,
                  float pd, long cycle) {
-    if (pipe_fd < 0) return;
     char buf[128];
     int n = snprintf(buf, sizeof(buf), "%s %u %.4f %.4f %ld\n",
                      event, tick, theta, pd, cycle);
-    /* non-blocking write — drop if no reader */
-    int w = write(pipe_fd, buf, (size_t)n); (void)w;
+    if (pipe_fd >= 0) {
+        int w = write(pipe_fd, buf, (size_t)n); (void)w;
+    }
     printf("[sched] %s  tick=%-8u  θ=%.4f  pd=%.4f  cycle=%ld\n",
            event, tick, theta, pd, cycle);
     fflush(stdout);
@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
     struct sockaddr_in addr = {.sin_family=AF_INET,
                                .sin_port=htons((uint16_t)port),
                                .sin_addr.s_addr=INADDR_ANY};
@@ -138,21 +139,25 @@ int main(int argc, char **argv) {
 
         if (pd < MIN_PD) { in_trough = 0; in_peak = 0; continue; }
 
-        /* trough window */
-        if (theta < TROUGH_THRESH && !in_trough) {
-            in_trough = 1;
-            in_peak   = 0;
-            emit("SUBMIT ", tick, theta, pd, cycle);
-        } else if (theta >= TROUGH_THRESH) {
-            in_trough = 0;
+        /* trough window — one SUBMIT per cycle */
+        if (theta < TROUGH_THRESH) {
+            if (!in_trough) {
+                in_trough = 1;
+                in_peak   = 0;
+                emit("SUBMIT ", tick, theta, pd, cycle);
+            }
+        } else if (theta > TROUGH_THRESH + 0.10f) {
+            in_trough = 0;  /* hysteresis before re-arm */
         }
 
-        /* peak window */
-        if (theta > PEAK_THRESH && theta < M_PI + 0.30f && !in_peak) {
-            in_peak   = 1;
-            in_trough = 0;
-            emit("COLLECT", tick, theta, pd, cycle);
-        } else if (theta < PEAK_THRESH) {
+        /* peak window — one COLLECT per cycle */
+        if (theta > PEAK_THRESH && theta < (float)(M_PI + 0.30)) {
+            if (!in_peak) {
+                in_peak   = 1;
+                in_trough = 0;
+                emit("COLLECT", tick, theta, pd, cycle);
+            }
+        } else if (theta < PEAK_THRESH - 0.10f) {
             in_peak = 0;
         }
     }

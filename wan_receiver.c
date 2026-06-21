@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons((uint16_t)port),
                                .sin_addr.s_addr=INADDR_ANY};
     bind(fd, (struct sockaddr *)&addr, sizeof(addr));
