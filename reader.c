@@ -148,6 +148,7 @@ int main(int argc, char **argv) {
     setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     double phases[3] = {-1.0, -1.0, -1.0};  /* index 1=Pi, 2=Pi2 */
+    struct timespec last_seen[3] = {{0},{0},{0}};
     double history[LOCK_WINDOW];
     int    hist_n = 0, hist_full = 0;
     double prev_diff = -1.0;
@@ -172,6 +173,7 @@ int main(int argc, char **argv) {
         if (sid != 1 && sid != 2) continue;
 
         phases[sid] = ntohf(pkt.theta);
+        clock_gettime(CLOCK_MONOTONIC, &last_seen[sid]);
         if (sid == 1) { pi1_tick = ntohl(pkt.tick); pi1_omega = ntohf(pkt.omega); }
 
         if (phases[1] < 0 || phases[2] < 0) continue;
@@ -195,9 +197,15 @@ int main(int argc, char **argv) {
                       std < LOCK_STD &&
                       fabs(phase_diff - PHASE_TARGET) < ANTI_THRESH);
 
-        /* send every tick to local phase_sched on 7403 */
+        /* send every tick to local phase_sched on 7403 — only when both beacons fresh */
         {
-            WanPulse wp;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long age1 = (now.tv_sec - last_seen[1].tv_sec) * 1000
+                      + (now.tv_nsec - last_seen[1].tv_nsec) / 1000000;
+            long age2 = (now.tv_sec - last_seen[2].tv_sec) * 1000
+                      + (now.tv_nsec - last_seen[2].tv_nsec) / 1000000;
+            if (age1 <= 500 && age2 <= 500) {            WanPulse wp;
             wp.magic  = htons(WAN_MAGIC);
             wp.tick   = htonl(pi1_tick);
             wp.theta  = htonf((float)phases[1]);
@@ -206,6 +214,7 @@ int main(int argc, char **argv) {
             wp.drains = htons((uint16_t)drains);
             sendto(sched_fd, &wp, sizeof(wp), 0,
                    (struct sockaddr *)&sched_addr, sizeof(sched_addr));
+            }
         }
 
         if (prev_diff >= 0 && prev_diff > PHASE_TARGET && phase_diff <= PHASE_TARGET) {
