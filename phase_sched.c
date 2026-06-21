@@ -9,7 +9,7 @@
  * Consumers: read /tmp/phase_sched (blocks until signal arrives)
  *
  * Usage: ./phase_sched [port] [pipe_path]
- *   port       default 7402
+ *   port       default 7403
  *   pipe_path  default /tmp/phase_sched
  *
  * Signal format (one line per event):
@@ -69,7 +69,10 @@ static void emit(const char *event, uint32_t tick, float theta,
     int n = snprintf(buf, sizeof(buf), "%s %u %.4f %.4f %ld\n",
                      event, tick, theta, pd, cycle);
     if (pipe_fd >= 0) {
-        int w = write(pipe_fd, buf, (size_t)n); (void)w;
+        if (write(pipe_fd, buf, (size_t)n) < 0) {
+            close(pipe_fd);
+            pipe_fd = -1;  /* retries open next packet */
+        }
     }
     printf("[sched] %s  tick=%-8u  θ=%.4f  pd=%.4f  cycle=%ld\n",
            event, tick, theta, pd, cycle);
