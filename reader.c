@@ -20,6 +20,7 @@
  */
 
 #include <arpa/inet.h>
+#include <inttypes.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -88,8 +89,10 @@ static uint64_t read_tx_bytes(void) {
         if (strstr(line, TC_DEV)) {
             /* fields: iface rx_bytes ... (8 rx fields) tx_bytes ... */
             char iface[32]; uint64_t v[16];
-            if (sscanf(line, " %31[^:]: %lu %lu %lu %lu %lu %lu %lu %lu "
-                              "%lu %lu %lu %lu %lu %lu %lu %lu",
+            if (sscanf(line, " %31[^:]: %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64
+                              " %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64
+                              " %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64
+                              " %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64,
                        iface, &v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7],
                        &v[8],&v[9],&v[10],&v[11],&v[12],&v[13],&v[14],&v[15]) == 17) {
                 fclose(f);
