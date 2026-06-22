@@ -5,7 +5,7 @@
 # Records phi from reader journal before, during, and after.
 # Reports: max drift, recovery time, signal dropout count.
 
-set -euo pipefail
+set -uo pipefail
 
 LOG=/tmp/perturb_$(date +%Y%m%d_%H%M%S).csv
 SCHED_LOG=/tmp/perturb_sched_$$.txt
@@ -18,17 +18,13 @@ echo "level,t,phi,pd,event" > "$LOG"
 log_phi() {
     local level="$1"
     local event="${2:-}"
-    sudo journalctl -u reader --no-pager -o cat -n 1 2>&1 \
-        | strings \
-        | grep -oE 'φ=[0-9]+\.[0-9]+' \
-        | while read -r phi; do
-            local pd
-            pd=$(sudo journalctl -u reader --no-pager -o cat -n 1 2>&1 \
-                | strings | grep -oE 'pd=[0-9]+\.[0-9]+' | head -1 | cut -d= -f2 || echo "0")
-            local t
-            t=$(date +%s%3N)
-            echo "$level,$t,${phi#φ=},$pd,$event"
-        done
+    local t phi pd line
+    t=$(date +%s%3N)
+    line=$(sudo journalctl -u reader --no-pager -o cat -n 2 2>&1 | strings | grep -oE '[0-9]\.[0-9]{3}' | head -1 || true)
+    phi=${line:-0}
+    pd=$(sudo journalctl -u reader --no-pager -o cat -n 2 2>&1 | strings | grep -oE '3\.[0-9]{3,4}' | tail -1 || true)
+    pd=${pd:-0}
+    echo "$level,$t,$phi,$pd,$event"
 }
 
 count_signals() {
