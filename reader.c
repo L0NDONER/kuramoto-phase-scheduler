@@ -176,6 +176,7 @@ int main(int argc, char **argv) {
     int    hist_n = 0, hist_full = 0;
     double prev_diff = -1.0;
     int    drains = 0;
+    struct timespec last_drain_ts = {0};
     /* last seen Pi1 telemetry for WAN pulse */
     uint32_t pi1_tick = 0;
     float    pi1_omega = 0.0f;
@@ -240,7 +241,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (prev_diff >= 0 && prev_diff > PHASE_TARGET && phase_diff <= PHASE_TARGET) {
+        struct timespec _now; clock_gettime(CLOCK_MONOTONIC, &_now);
+        long _since_drain = (_now.tv_sec - last_drain_ts.tv_sec) * 1000
+                          + (_now.tv_nsec - last_drain_ts.tv_nsec) / 1000000;
+        if (prev_diff >= 0 && prev_diff > PHASE_TARGET && phase_diff <= PHASE_TARGET
+            && _since_drain > 3000) {
+            last_drain_ts = _now;
             drain_async();
             drains++;
             if (wan_fd >= 0) {
