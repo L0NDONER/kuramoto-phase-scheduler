@@ -1,19 +1,22 @@
 /*
- * cpu_reader.c — Kuramoto axis consumer: DVFS modulator
+ * cpu_reader.c — Kuramoto axis consumer: DVFS + core parking modulator
  *
  * Subscribes to reader.c axis multicast on 239.0.0.2:7404 (AxisPulse).
- * Falls back to WanPulse on 7403 if port arg given.
  *
  * Step 1: Direct MSR writes via pre-opened /dev/cpu/N/msr fds.
- * Step 2: Logs (θ, f, V, power_W, temp_C, load) per tick to CSV.
+ * Step 2: Logs (θ, f, V, power_W, temp_C, load, active_cores) to CSV.
  * Step 3: Load-aware θ nudge. Sends LoadFeedback to reader on :7405.
+ * Step 4: Core parking policy — N "hot" cores ride full DVFS curve;
+ *         remainder are held at trough (f_min, V_OFFSET_MV) regardless
+ *         of θ. Voltage is package-wide so all cores benefit at trough.
  *
- * Mappings (θ_eff = θ + load_nudge):
- *   f(θ_eff) = f_min + (f_max - f_min) * (1 - cos θ_eff) / 2
- *   V(θ_eff) = V_OFFSET_MV * (1 + cos θ_eff) / 2
+ * Usage: sudo ./cpu_reader [reader_ip] [--cores-active=N] [--park-cores]
+ *   --park-cores        1 hot core, rest parked at floor
+ *   --cores-active=N    N hot cores (1–n_cpus), rest parked
+ *   (default: all cores hot, current DVFS behaviour)
  *
- * Usage: sudo ./cpu_reader [reader_ip]   (default: axis multicast)
- *        Ctrl-C restores stock voltage + governor.
+ * Pin reader to cpu0 before parking: taskset -c 0 in reader.service.
+ * Ctrl-C restores stock voltage + governor on all cores.
  */
 
 #define _GNU_SOURCE
@@ -83,6 +86,7 @@ static float htonf(float f) {
 /* ── cpufreq ─────────────────────────────────────────────────────────────── */
 
 static int  n_cpus = 0;
+static int  cores_active = 0;   /* set after arg parse + discover */
 static char cpu_paths[64][320];
 static char gov_paths[64][320];
 static char saved_gov[64][64];
@@ -122,13 +126,15 @@ static void set_governor(const char *gov) {
     }
 }
 
-static void set_freq(long khz) {
-    char buf[32];
+
+/* set freq on a single CPU by logical index (bypasses cpu_paths[] order) */
+static void set_freq_core(int cpu_num, long khz) {
+    char path[320], buf[32];
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_setspeed", cpu_num);
     snprintf(buf, sizeof(buf), "%ld\n", khz);
-    for (int i = 0; i < n_cpus; i++) {
-        FILE *f = fopen(cpu_paths[i], "w");
-        if (f) { fputs(buf, f); fclose(f); }
-    }
+    FILE *f = fopen(path, "w");
+    if (f) { fputs(buf, f); fclose(f); }
 }
 
 static void restore_governors(void) {
@@ -278,14 +284,28 @@ int main(int argc, char **argv) {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
-    /* optional: explicit reader IP for load feedback destination */
-    const char *reader_ip = (argc >= 2) ? argv[1] : "127.0.0.1";
+    /* parse args: [reader_ip] [--cores-active=N] [--park-cores] */
+    const char *reader_ip   = "127.0.0.1";
+    int         cores_arg   = -1;   /* -1 = not set, use all */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--cores-active=", 15) == 0)
+            cores_arg = atoi(argv[i] + 15);
+        else if (strcmp(argv[i], "--park-cores") == 0)
+            cores_arg = 1;
+        else
+            reader_ip = argv[i];
+    }
 
     cpufreq_discover();
     if (n_cpus == 0 || f_min == 0 || f_max == 0) {
         fprintf(stderr, "[cpu_reader] cpufreq not available\n");
         return 1;
     }
+
+    /* resolve cores_active */
+    cores_active = (cores_arg > 0) ? cores_arg : n_cpus;
+    if (cores_active > n_cpus) cores_active = n_cpus;
+    if (cores_active < 1)      cores_active = 1;
 
     msr_open_all();
     rapl_open();
@@ -300,14 +320,18 @@ int main(int argc, char **argv) {
     }
     FILE *log_fp = fopen(logpath, "w");
     if (log_fp)
-        fprintf(log_fp, "t_ms,theta1,theta_eff,freq_khz,v_offset_mv,power_w,temp_c,load_pct\n");
+        fprintf(log_fp,
+                "t_ms,theta1,theta_eff,freq_khz,v_offset_mv,"
+                "power_w,temp_c,load_pct,active_cores\n");
 
-    printf("[cpu_reader] %d CPUs  %ldkHz–%ldkHz  V_max=%dmV\n",
-           n_cpus, f_min, f_max, V_OFFSET_MV);
+    printf("[cpu_reader] %d CPUs  %ldkHz–%ldkHz  V_max=%dmV  hot=%d/parked=%d\n",
+           n_cpus, f_min, f_max, V_OFFSET_MV, cores_active, n_cpus - cores_active);
     printf("[cpu_reader] log → %s\n", logpath);
 
     set_governor("userspace");
-    set_freq(f_max);
+    /* hot cores start at peak; parked cores go straight to floor */
+    for (int i = 0; i < cores_active; i++)  set_freq_core(i, f_max);
+    for (int i = cores_active; i < n_cpus; i++) set_freq_core(i, f_min);
     msr_write_voltage(0);
 
     /* subscribe to axis multicast 239.0.0.2:7404 */
@@ -373,17 +397,21 @@ int main(int argc, char **argv) {
         double nudge     = load * LOAD_NUDGE_MAX;
         double theta_eff = fmod((double)theta + nudge, 2.0 * M_PI);
 
-        /* Step 1+3: apply DVFS */
+        /* Step 1+3+4: apply DVFS — hot cores follow θ_eff, parked stay at floor */
         if (locked) {
             double frac = (1.0 - cos(theta_eff)) / 2.0;
             cur_khz = f_min + (long)((double)(f_max - f_min) * frac);
             cur_mv  = (int)(V_OFFSET_MV * (1.0 + cos(theta_eff)) / 2.0);
-            set_freq(cur_khz);
+            for (int i = 0; i < cores_active; i++)
+                set_freq_core(i, cur_khz);
+            for (int i = cores_active; i < n_cpus; i++)
+                set_freq_core(i, f_min);
             msr_write_voltage(cur_mv);
         } else if (locked_prev) {
             cur_khz = f_max;
             cur_mv  = 0;
-            set_freq(cur_khz);
+            for (int i = 0; i < cores_active; i++)  set_freq_core(i, f_max);
+            for (int i = cores_active; i < n_cpus; i++) set_freq_core(i, f_min);
             msr_write_voltage(0);
         }
         locked_prev = locked;
@@ -396,9 +424,9 @@ int main(int argc, char **argv) {
         long t_ms = now.tv_sec * 1000L + now.tv_nsec / 1000000L;
 
         if (log_fp) {
-            fprintf(log_fp, "%ld,%.4f,%.4f,%ld,%d,%.2f,%.1f,%.3f\n",
+            fprintf(log_fp, "%ld,%.4f,%.4f,%ld,%d,%.2f,%.1f,%.3f,%d\n",
                     t_ms, theta, theta_eff, cur_khz, cur_mv,
-                    power, temp, load);
+                    power, temp, load, cores_active);
             fflush(log_fp);
         }
 
@@ -419,18 +447,19 @@ int main(int argc, char **argv) {
         if (temp  >= 0) snprintf(tmp_buf, sizeof(tmp_buf), "%.0f°C", temp);
         else            snprintf(tmp_buf, sizeof(tmp_buf), "---");
 
-        printf("\r[cpu_reader] θ=%.3f(→%.3f)  %s  %ldkHz  %+dmV  %s  %s  load=%.0f%%   ",
+        printf("\r[cpu_reader] θ=%.3f(→%.3f)  %s  %ldkHz  %+dmV  %s  %s  load=%.0f%%  [%d/%dhot]   ",
                theta, theta_eff,
                locked ? "LOCKED" : "      ",
                cur_khz, cur_mv,
                pwr_buf, tmp_buf,
-               load * 100.0);
+               load * 100.0,
+               cores_active, n_cpus);
         fflush(stdout);
     }
 
     printf("\n[cpu_reader] restoring stock...\n");
     msr_write_voltage(0);
-    set_freq(f_max);
+    for (int i = 0; i < n_cpus; i++) set_freq_core(i, f_max);
     restore_governors();
     msr_close_all();
     if (rapl_fd >= 0) close(rapl_fd);
