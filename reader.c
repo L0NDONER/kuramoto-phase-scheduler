@@ -24,6 +24,7 @@
  */
 
 #include <arpa/inet.h>
+#include <endian.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
@@ -75,7 +76,8 @@ typedef struct __attribute__((packed)) {
     float    theta;
     float    omega;
     uint8_t  _pad;
-} Beacon;   /* 13 bytes */
+    uint64_t t0_ns;   /* CLOCK_REALTIME at tick 0 (ns since epoch); 0 otherwise */
+} Beacon;   /* 24 bytes */
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;
@@ -105,7 +107,8 @@ typedef struct __attribute__((packed)) {
     float    pd_dev;     /* |pd − π|  (quality: lower = tighter) */
     float    load_avg;   /* rolling avg load from consumers, 0–1 */
     uint16_t drains;
-} AxisPulse;  /* 30 bytes */
+    uint64_t t0_ns;      /* CLOCK_REALTIME anchor for triggering sid (ns since epoch); 0 if not yet seen */
+} AxisPulse;  /* 38 bytes */
 
 /*
  * LoadFeedback — sent by consumers to reader on port 7405.
@@ -243,6 +246,7 @@ int main(int argc, char **argv) {
     struct timespec last_seen[3]= {{0},{0},{0}};
     uint32_t ticks[3]           = {0, 0, 0};
     float    omegas[3]          = {0.0f, 0.0f, 0.0f};
+    uint64_t t0_ns[3]           = {0, 0, 0};
 
     double history[LOCK_WINDOW];
     int    hist_n = 0, hist_full = 0;
@@ -277,6 +281,15 @@ int main(int argc, char **argv) {
         omegas[sid]  = ntohf(pkt.omega);
         ticks[sid]   = ntohl(pkt.tick);
         clock_gettime(CLOCK_MONOTONIC, &last_seen[sid]);
+        if (ntohl(pkt.tick) == 0 && pkt.t0_ns != 0) {
+            t0_ns[sid] = be64toh(pkt.t0_ns);
+            time_t sec = (time_t)(t0_ns[sid] / 1000000000ULL);
+            uint32_t ms = (uint32_t)((t0_ns[sid] % 1000000000ULL) / 1000000ULL);
+            struct tm *tm = gmtime(&sec);
+            printf("\n[reader] sid=%d anchor %04d-%02d-%02dT%02d:%02d:%02d.%03dZ\n",
+                   sid, tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday,
+                   tm->tm_hour, tm->tm_min, tm->tm_sec, ms);
+        }
 
         if (phases[1] < 0 || phases[2] < 0) goto drain_load;
 
@@ -310,6 +323,7 @@ int main(int argc, char **argv) {
             ap.pd_dev   = htonf((float)pd_dev);
             ap.load_avg = htonf((float)load_avg);
             ap.drains   = htons((uint16_t)drains);
+            ap.t0_ns    = htobe64(t0_ns[sid]);
             sendto(axis_fd, &ap, sizeof(ap), 0,
                    (struct sockaddr *)&axis_addr, sizeof(axis_addr));
         }

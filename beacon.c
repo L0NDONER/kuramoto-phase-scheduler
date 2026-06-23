@@ -3,16 +3,18 @@
  *
  * Usage: sudo ./beacon <pi|pi2>
  *
- * Packet format (network byte order, 13 bytes):
+ * Packet format (network byte order, 24 bytes):
  *   uint16_t magic  = 0x1B4A
  *   uint8_t  sid    = 1 (pi) | 2 (pi2)
  *   uint32_t tick
  *   float    theta
  *   float    omega
  *   uint8_t  _pad
+ *   uint64_t t0_ns  = CLOCK_REALTIME at tick 0 (ns since epoch); 0 on other ticks
  */
 
 #define _GNU_SOURCE
+#include <endian.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -64,6 +66,7 @@ typedef struct __attribute__((packed)) {
     float    theta;
     float    omega;
     uint8_t  _pad;
+    uint64_t t0_ns;
 } Beacon;
 
 static double noise(void) {
@@ -135,7 +138,10 @@ int main(int argc, char *argv[]) {
 
     memset(history, 0, sizeof(history));
 
-    printf("[beacon:%s] sid=%d omega=%.4f\n", argv[1], sid, omega);
+    struct timespec t0;
+    clock_gettime(CLOCK_REALTIME, &t0);
+    printf("[beacon:%s] sid=%d omega=%.4f anchor=%ld.%09ld\n",
+           argv[1], sid, omega, (long)t0.tv_sec, (long)t0.tv_nsec);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -227,6 +233,9 @@ int main(int argc, char *argv[]) {
         out.theta = htonf((float)theta);
         out.omega = htonf((float)omega);
         out._pad  = 0;
+        out.t0_ns = (tick == 0)
+            ? htobe64((uint64_t)t0.tv_sec * 1000000000ULL + (uint64_t)t0.tv_nsec)
+            : 0;
         sendto(tx, &out, sizeof(out), 0,
                (struct sockaddr *)&dst, sizeof(dst));
 

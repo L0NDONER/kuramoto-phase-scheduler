@@ -9,6 +9,7 @@
  * Usage: sudo ./tm1_reader [reader_ip]
  */
 
+#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -42,8 +43,8 @@
 typedef struct __attribute__((packed)) {
     uint16_t magic; uint8_t sid; uint8_t locked; uint32_t tick;
     float theta1; float theta2; float pd; float pd_dev;
-    float load_avg; uint16_t drains;
-} AxisPulse;
+    float load_avg; uint16_t drains; uint64_t t0_ns;
+} AxisPulse;  /* 38 bytes */
 
 typedef struct __attribute__((packed)) {
     uint16_t magic; float load; float temp;
@@ -155,13 +156,19 @@ int main(int argc, char **argv) {
             AXIS_GRP, AXIS_PORT, reader_ip, LOAD_PORT, csvpath);
 
     AxisPulse ap;
-    uint64_t cur_tm1 = TM1_FULL;
+    uint64_t cur_tm1    = TM1_FULL;
     uint32_t tick_count = 0;
+    uint64_t t0_ns      = 0;
 
     while (1) {
         ssize_t n = recv(axis_fd, &ap, sizeof(ap), 0);
         if (n != sizeof(ap)) continue;
         if (ntohs(ap.magic) != AXIS_MAGIC) continue;
+
+        if (ap.t0_ns) t0_ns = be64toh(ap.t0_ns);
+        uint64_t utc_ns = t0_ns
+            ? t0_ns + (uint64_t)ntohl(ap.tick) * 50000000ULL : 0;
+        (void)utc_ns;
 
         int locked = ap.locked;
         double theta = ntohf(ap.theta1);

@@ -21,6 +21,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <endian.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -65,7 +66,8 @@ typedef struct __attribute__((packed)) {
     float    pd_dev;
     float    load_avg;
     uint16_t drains;
-} AxisPulse;  /* 30 bytes */
+    uint64_t t0_ns;
+} AxisPulse;  /* 38 bytes */
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;
@@ -365,15 +367,21 @@ int main(int argc, char **argv) {
     int    hist_n = 0, hist_full = 0;
     memset(history, 0, sizeof(history));
 
-    long   cur_khz     = f_max;
-    int    cur_mv      = 0;
-    int    locked_prev = 0;
+    long     cur_khz     = f_max;
+    int      cur_mv      = 0;
+    int      locked_prev = 0;
+    uint64_t t0_ns       = 0;
 
     while (running) {
         AxisPulse ap;
         ssize_t n = recv(fd, &ap, sizeof(ap), 0);
         if (n != sizeof(ap)) continue;
         if (ntohs(ap.magic) != AXIS_MAGIC) continue;
+
+        if (ap.t0_ns) t0_ns = be64toh(ap.t0_ns);
+        uint64_t utc_ns = t0_ns
+            ? t0_ns + (uint64_t)ntohl(ap.tick) * 50000000ULL : 0;
+        (void)utc_ns;
 
         float  theta  = ntohf(ap.theta1);
         float  pd     = ntohf(ap.pd);
