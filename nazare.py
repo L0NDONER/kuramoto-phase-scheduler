@@ -61,7 +61,7 @@ commit_fd = open_fifo(FIFO_COMMIT)
 staged = []          # list of staged intents
 last_alignment = {}  # last AxisPulse packet
 commit_pending = False
-consumer_state = {"A": {}, "B": {}}
+consumer_state = {"A": {}, "B": {}, "pathway": {"X": 0.0, "Y": 0.0}}
 theta_prev = {"A": None, "B": None}   # for descent detection
 cycle = 0                              # increments each full A drain window
 
@@ -91,6 +91,11 @@ def parse_axispulse_packet(data):
 
 _DRAIN_WIN = 0.25   # rad either side of drain point
 
+def _a_leads(pkt):
+    """True when A is ahead of anti-phase: signed pd > π."""
+    signed = (pkt["theta1"] - pkt["theta2"]) % (2 * math.pi)
+    return signed > math.pi
+
 def _eval_one(cond, pkt):
     """Evaluate a single condition token."""
     if not cond:
@@ -103,6 +108,10 @@ def _eval_one(cond, pkt):
         return theta_prev["B"] is not None and pkt["theta2"] < theta_prev["B"]
     if cond == "B.ascending":
         return theta_prev["B"] is not None and pkt["theta2"] > theta_prev["B"]
+    if cond == "A.leading":
+        return _a_leads(pkt)
+    if cond == "A.following":
+        return not _a_leads(pkt)
     if cond == "cycle=even":
         return cycle % 2 == 0
     if cond == "cycle=odd":
@@ -183,6 +192,13 @@ def _try_fire(staged, pkt):
                 target, tbody = prefix, body
             msg = _apply_intent(target, tbody, theta)
             print(f"[{prefix}→{target}] θ={theta:.3f}  cycle={cycle}  {msg}")
+            # binary decision readout when pathway weights updated
+            if target == "pathway":
+                pw = consumer_state["pathway"]
+                x, y = float(pw.get("X", 0)), float(pw.get("Y", 0))
+                decision = "YES (A leads)" if x > y else "NO  (B leads)"
+                margin = abs(x - y)
+                print(f"  ↳ decision: {decision}  X={x:.2f} Y={y:.2f} margin={margin:.2f}")
             if "repeat" in flags.split(","):
                 remaining.append(intent)   # re-stage for next cycle
         else:
