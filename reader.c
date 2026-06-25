@@ -182,6 +182,17 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGCHLD, SIG_IGN);
 
+    /* --sid N: follow only sid 1 or 2; 0 = both (default) */
+    int target_sid = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--sid") == 0 && i+1 < argc) {
+            target_sid = atoi(argv[i+1]);
+            for (int j = i; j < argc-2; j++) argv[j] = argv[j+2];
+            argc -= 2;
+            break;
+        }
+    }
+
     /* optional legacy WAN unicast */
     int wan_fd = -1;
     struct sockaddr_in wan_addr = {0};
@@ -276,12 +287,13 @@ int main(int argc, char **argv) {
         if (n != sizeof(pkt) || ntohs(pkt.magic) != BEACON_MAGIC) goto drain_load;
         int sid = pkt.sid;
         if (sid != 1 && sid != 2) goto drain_load;
+        if (target_sid != 0 && sid != target_sid) goto drain_load;
 
         phases[sid]  = ntohf(pkt.theta);
         omegas[sid]  = ntohf(pkt.omega);
         ticks[sid]   = ntohl(pkt.tick);
         clock_gettime(CLOCK_MONOTONIC, &last_seen[sid]);
-        if (ntohl(pkt.tick) == 0 && pkt.t0_ns != 0) {
+        if (pkt.t0_ns != 0) {
             t0_ns[sid] = be64toh(pkt.t0_ns);
             time_t sec = (time_t)(t0_ns[sid] / 1000000000ULL);
             uint32_t ms = (uint32_t)((t0_ns[sid] % 1000000000ULL) / 1000000ULL);
@@ -289,6 +301,30 @@ int main(int argc, char **argv) {
             printf("\n[reader] sid=%d anchor %04d-%02d-%02dT%02d:%02d:%02d.%03dZ\n",
                    sid, tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday,
                    tm->tm_hour, tm->tm_min, tm->tm_sec, ms);
+        }
+
+        if (target_sid != 0) {
+            /* single-oscillator mode: emit AxisPulse for this sid only */
+            AxisPulse ap = {0};
+            ap.magic    = htons(AXIS_MAGIC);
+            ap.sid      = (uint8_t)sid;
+            ap.locked   = 0;
+            ap.tick     = htonl(ticks[sid]);
+            ap.theta1   = htonf((float)(sid == 1 ? phases[1] : 0.0));
+            ap.theta2   = htonf((float)(sid == 2 ? phases[2] : 0.0));
+            ap.pd       = 0;
+            ap.pd_dev   = 0;
+            ap.load_avg = htonf((float)load_avg);
+            ap.drains   = 0;
+            ap.t0_ns    = htobe64(t0_ns[sid]);
+            sendto(axis_fd, &ap, sizeof(ap), 0,
+                   (struct sockaddr *)&axis_addr, sizeof(axis_addr));
+            int bar = (int)(phases[sid] / (2*M_PI) * 39);
+            printf("\r[axis:sid%d] θ=%.3f  ", sid, phases[sid]);
+            for (int i=0;i<bar;i++)  printf("█");
+            for (int i=bar;i<40;i++) printf("░");
+            fflush(stdout);
+            goto drain_load;
         }
 
         if (phases[1] < 0 || phases[2] < 0) goto drain_load;
