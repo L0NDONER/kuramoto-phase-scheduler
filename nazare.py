@@ -83,10 +83,8 @@ theta_prev = {"A": None, "B": None}   # for descent detection
 cycle = 0                              # increments each full A drain window
 
 # Pathway stability / synaptic scaling
-DRIFT_THRESH  = 0.25   # pd_dev above this = incoherent geometry
-DECAY_RATE    = 0.95   # multiplicative decay per unstable tick
-DRIFT_LIMIT   = 10     # consecutive ticks before decay triggers
-_drift_ticks  = 0      # consecutive high-jitter tick counter
+DRIFT_THRESH = 0.25   # pd_dev above this = incoherent geometry
+DECAY_RATE   = 0.95   # multiplicative decay per unstable tick
 
 # ------------------------------------------------------------
 # Helpers
@@ -193,21 +191,19 @@ def _parse_intent(raw):
     body, _, cond = body_cond.partition("?")
     return prefix, body.strip(), cond.strip(), flags_part.strip()
 
-def _update_pathway_stability(pkt):
-    """Synaptic scaling: decay pathway weights when phase geometry is incoherent."""
-    global _drift_ticks
-    pw = consumer_state["pathway"]
+def _apply_autonomous_decay(pkt):
+    """
+    Apply multiplicative decay to pathway weights if drift is high.
+    Maintains synaptic homeostasis at the cerebellar level.
+    Called before intent evaluation so intents always see current valid state.
+    """
     if pkt["pd_dev"] > DRIFT_THRESH:
-        _drift_ticks += 1
-        if _drift_ticks >= DRIFT_LIMIT:
-            pw["X"] = float(pw.get("X", 0)) * DECAY_RATE
-            pw["Y"] = float(pw.get("Y", 0)) * DECAY_RATE
-            x, y = pw["X"], pw["Y"]
-            print(f"[stability] drift tick={_drift_ticks}  pd_dev={pkt['pd_dev']:.3f}  "
-                  f"X={x:.3f} Y={y:.3f}  (decay applied)")
-            send_cortex_pulse(x, y, cycle, abs(x - y))
-    else:
-        _drift_ticks = 0
+        pw = consumer_state["pathway"]
+        pw["X"] = float(pw.get("X", 0)) * DECAY_RATE
+        pw["Y"] = float(pw.get("Y", 0)) * DECAY_RATE
+        x, y = pw["X"], pw["Y"]
+        print(f"[stability] pd_dev={pkt['pd_dev']:.3f}  decay → X={x:.4f} Y={y:.4f}")
+        send_cortex_pulse(x, y, cycle, abs(x - y))
 
 def _try_fire(staged, pkt):
     """Fire intents in their drain window that pass their condition."""
@@ -268,7 +264,7 @@ while True:
             if pkt:
                 last_alignment = pkt
                 if pkt["locked"]:
-                    _update_pathway_stability(pkt)
+                    _apply_autonomous_decay(pkt)
                 if commit_pending and staged and pkt["locked"]:
                     staged = _try_fire(staged, pkt)
                     if not staged:
