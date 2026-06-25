@@ -13,6 +13,23 @@ import math
 MCAST_GRP = "239.0.0.2"
 MCAST_PORT = 7404
 
+# Cortical output — LMDE slow integrator
+CORTEX_IP   = "10.0.0.175"
+CORTEX_PORT = 7410
+
+# CortexPulse wire format: magic(H) X(f) Y(f) cycle(I) margin(f) — 18 bytes
+_CP_FMT   = ">HffIf"
+_CP_MAGIC = 0x4358   # "CX"
+
+_cortex_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def send_cortex_pulse(x, y, cycle, margin):
+    pkt = struct.pack(_CP_FMT, _CP_MAGIC, x, y, cycle, margin)
+    try:
+        _cortex_sock.sendto(pkt, (CORTEX_IP, CORTEX_PORT))
+    except OSError:
+        pass
+
 # FIFOs for stage/commit
 FIFO_STAGE = "/tmp/nazare_stage"
 FIFO_COMMIT = "/tmp/nazare_commit"
@@ -64,6 +81,12 @@ commit_pending = False
 consumer_state = {"A": {}, "B": {}, "pathway": {"X": 0.0, "Y": 0.0}}
 theta_prev = {"A": None, "B": None}   # for descent detection
 cycle = 0                              # increments each full A drain window
+
+# Pathway stability / synaptic scaling
+DRIFT_THRESH  = 0.25   # pd_dev above this = incoherent geometry
+DECAY_RATE    = 0.95   # multiplicative decay per unstable tick
+DRIFT_LIMIT   = 10     # consecutive ticks before decay triggers
+_drift_ticks  = 0      # consecutive high-jitter tick counter
 
 # ------------------------------------------------------------
 # Helpers
@@ -170,6 +193,22 @@ def _parse_intent(raw):
     body, _, cond = body_cond.partition("?")
     return prefix, body.strip(), cond.strip(), flags_part.strip()
 
+def _update_pathway_stability(pkt):
+    """Synaptic scaling: decay pathway weights when phase geometry is incoherent."""
+    global _drift_ticks
+    pw = consumer_state["pathway"]
+    if pkt["pd_dev"] > DRIFT_THRESH:
+        _drift_ticks += 1
+        if _drift_ticks >= DRIFT_LIMIT:
+            pw["X"] = float(pw.get("X", 0)) * DECAY_RATE
+            pw["Y"] = float(pw.get("Y", 0)) * DECAY_RATE
+            x, y = pw["X"], pw["Y"]
+            print(f"[stability] drift tick={_drift_ticks}  pd_dev={pkt['pd_dev']:.3f}  "
+                  f"X={x:.3f} Y={y:.3f}  (decay applied)")
+            send_cortex_pulse(x, y, cycle, abs(x - y))
+    else:
+        _drift_ticks = 0
+
 def _try_fire(staged, pkt):
     """Fire intents in their drain window that pass their condition."""
     global cycle
@@ -192,13 +231,14 @@ def _try_fire(staged, pkt):
                 target, tbody = prefix, body
             msg = _apply_intent(target, tbody, theta)
             print(f"[{prefix}→{target}] θ={theta:.3f}  cycle={cycle}  {msg}")
-            # binary decision readout when pathway weights updated
+            # binary decision readout + cortex relay when pathway weights updated
             if target == "pathway":
                 pw = consumer_state["pathway"]
                 x, y = float(pw.get("X", 0)), float(pw.get("Y", 0))
                 decision = "YES (A leads)" if x > y else "NO  (B leads)"
                 margin = abs(x - y)
                 print(f"  ↳ decision: {decision}  X={x:.2f} Y={y:.2f} margin={margin:.2f}")
+                send_cortex_pulse(x, y, cycle, margin)
             if "repeat" in flags.split(","):
                 remaining.append(intent)   # re-stage for next cycle
         else:
@@ -227,6 +267,8 @@ while True:
             pkt = parse_axispulse_packet(data)
             if pkt:
                 last_alignment = pkt
+                if pkt["locked"]:
+                    _update_pathway_stability(pkt)
                 if commit_pending and staged and pkt["locked"]:
                     staged = _try_fire(staged, pkt)
                     if not staged:
