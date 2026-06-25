@@ -91,23 +91,18 @@ def parse_axispulse_packet(data):
 
 _DRAIN_WIN = 0.25   # rad either side of drain point
 
-def _eval_condition(cond, pkt):
-    """
-    Evaluate a condition string against current state.
-    Supported forms:
-      B.key=val      consumer_state["B"]["key"] == "val"
-      A.key=val      consumer_state["A"]["key"] == "val"
-      A.descending   theta1 is falling this tick
-      B.descending   theta2 is falling this tick
-      cycle=even     cycle counter is even
-      cycle=odd      cycle counter is odd
-    """
+def _eval_one(cond, pkt):
+    """Evaluate a single condition token."""
     if not cond:
         return True
     if cond == "A.descending":
         return theta_prev["A"] is not None and pkt["theta1"] < theta_prev["A"]
+    if cond == "A.ascending":
+        return theta_prev["A"] is not None and pkt["theta1"] > theta_prev["A"]
     if cond == "B.descending":
         return theta_prev["B"] is not None and pkt["theta2"] < theta_prev["B"]
+    if cond == "B.ascending":
+        return theta_prev["B"] is not None and pkt["theta2"] > theta_prev["B"]
     if cond == "cycle=even":
         return cycle % 2 == 0
     if cond == "cycle=odd":
@@ -118,17 +113,56 @@ def _eval_condition(cond, pkt):
         return consumer_state.get(who, {}).get(key) == val
     return True
 
-def _apply_intent(consumer, body, theta):
-    """Parse and apply intent body (key=val or plain action). Returns display string."""
-    if "=" in body:
+def _eval_condition(cond, pkt):
+    """Evaluate condition string; '+' = AND, '|' = OR."""
+    if not cond:
+        return True
+    if "+" in cond:
+        return all(_eval_one(c.strip(), pkt) for c in cond.split("+"))
+    if "|" in cond:
+        return any(_eval_one(c.strip(), pkt) for c in cond.split("|"))
+    return _eval_one(cond, pkt)
+
+def _apply_intent(target, body, theta):
+    """
+    Apply intent body to target consumer. Body forms:
+      key=val          set state
+      key+=num         increment float state
+      key-=num         decrement float state
+      action           plain fire
+    Target may differ from the firing consumer (cross-consumer plasticity).
+    """
+    st = consumer_state[target]
+    if "+=" in body:
+        key, _, val = body.partition("+=")
+        st[key] = float(st.get(key, 0)) + float(val)
+        return f"{target}.{key} += {val} → {st[key]:.4f}"
+    elif "-=" in body:
+        key, _, val = body.partition("-=")
+        st[key] = float(st.get(key, 0)) - float(val)
+        return f"{target}.{key} -= {val} → {st[key]:.4f}"
+    elif "=" in body:
         key, _, val = body.partition("=")
-        consumer_state[consumer][key] = val
-        return f"set {key}={val}  state={consumer_state[consumer]}"
+        st[key] = val
+        return f"{target}.{key} = {val}"
     else:
         return f"{body} fired"
 
+def _parse_intent(raw):
+    """Parse 'PREFIX:body?condition:flags' → (prefix, body, cond, flags)."""
+    prefix, _, rest = raw.partition(":")
+    flags_part = ""
+    if rest.count(":") >= 1 and "?" in rest:
+        body_cond, _, flags_part = rest.rpartition(":")
+    elif rest.count(":") >= 1 and "?" not in rest:
+        body_cond, _, flags_part = rest.rpartition(":")
+    else:
+        body_cond = rest
+    body, _, cond = body_cond.partition("?")
+    return prefix, body.strip(), cond.strip(), flags_part.strip()
+
 def _try_fire(staged, pkt):
-    """Fire intents that are in their drain window and pass their condition."""
+    """Fire intents in their drain window that pass their condition."""
     global cycle
     theta1 = pkt["theta1"]
     theta2 = pkt["theta2"]
@@ -138,27 +172,21 @@ def _try_fire(staged, pkt):
         cycle += 1
     remaining = []
     for intent in staged:
-        if intent.startswith("A:"):
-            body_cond = intent[2:].strip()
-            body, _, cond = body_cond.partition("?")
-            if a_win and _eval_condition(cond, pkt):
-                msg = _apply_intent("A", body, theta1)
-                print(f"[A] θ1={theta1:.3f}  cycle={cycle}  {msg}")
+        prefix, body, cond, flags = _parse_intent(intent)
+        in_win = (prefix == "A" and a_win) or (prefix == "B" and b_win)
+        theta = theta1 if prefix == "A" else theta2
+        if in_win and _eval_condition(cond, pkt):
+            # body may target another consumer: "B.key+=val" fired by A
+            if "." in body and body.split(".")[0] in consumer_state:
+                target, _, tbody = body.partition(".")
             else:
-                remaining.append(intent)
-        elif intent.startswith("B:"):
-            body_cond = intent[2:].strip()
-            body, _, cond = body_cond.partition("?")
-            if b_win and _eval_condition(cond, pkt):
-                msg = _apply_intent("B", body, theta2)
-                print(f"[B] θ2={theta2:.3f}  cycle={cycle}  {msg}")
-            else:
-                remaining.append(intent)
+                target, tbody = prefix, body
+            msg = _apply_intent(target, tbody, theta)
+            print(f"[{prefix}→{target}] θ={theta:.3f}  cycle={cycle}  {msg}")
+            if "repeat" in flags.split(","):
+                remaining.append(intent)   # re-stage for next cycle
         else:
-            if pkt["locked"]:
-                print(f"[*] {intent}")
-            else:
-                remaining.append(intent)
+            remaining.append(intent)
     theta_prev["A"] = theta1
     theta_prev["B"] = theta2
     return remaining
