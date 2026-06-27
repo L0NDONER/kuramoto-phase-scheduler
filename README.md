@@ -1,6 +1,6 @@
 # Kuramoto Substrate
 
-A self-synchronising oscillator pair used as a timing substrate for a three-tier cerebellar learning stack and a closed-loop thermal regulator.
+A self-synchronising oscillator pair used as a timing substrate for a three-tier cerebellar learning stack, a closed-loop thermal regulator, and a phase-space intent signalling layer.
 
 Two Raspberry Pis run repulsive Kuramoto coupling over UDP multicast, converge to anti-phase (φ≈π), and distribute stable timing to downstream consumers via a Mint axis node. No shared clock. No central controller.
 
@@ -60,6 +60,22 @@ e_C    = 1.0·(pred_err − 0.0045) − 0.15·temlum
 
 The AxisPulse substrate (~40Hz) paces the temlum update. The cerebellar pred_err arrives at ~1Hz. The actuator only commits a topology change after a 15-second sustained-majority vote. Three timescales — substrate, signal, actuation — are cleanly separated, preventing chatter without losing responsiveness.
 
+### 6. Glyph intent signals — pre-semantic state transitions via phase injection
+
+An intent signal is not a packet. It is a phase-space event: a deformation of the oscillator field that every neuron feels simultaneously, with no routing and no decoding.
+
+The axis node (`reader_glyph.c`) injects a spoofed Pi1 beacon with `θ1 + Δ` during an intent window. Pi2's Kuramoto coupling responds to the perturbed phase. Every downstream consumer sees the real `pd_dev` excursion in AxisPulse — the signal propagates through actual coupling dynamics.
+
+Three intent types, distinguished by amplitude and duration:
+
+| Intent | Δ (rad) | Duration | pd_dev observed | Effect |
+|---|---|---|---|---|
+| ADVISORY | 0.30 | 1 unit (~100ms) | ~0.30 | Soft bias, readable excursion |
+| DIRECTIVE | 0.50 | 3 units (~300ms) | ~0.50 | Sustained push, neurons commit |
+| ALARM | 1.00 | 2 ticks (~25ms) | **1.035** | Attractor collapsed, field rings to baseline |
+
+The alarm overshots the π basin entirely — pd_dev exceeded π/3, coherence collapsed, the system re-locked on its own. The shape of the perturbation is the instruction. Neurons respond to the excursion the same way they respond to any phase deviation: no if-else, no decode, no routing. DCN sends error corrections top-down. Glyphs inject intent bottom-up through the oscillator field.
+
 ---
 
 ## Architecture
@@ -101,6 +117,7 @@ Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) �
 | 7403 | UDP loopback | reader→phase_sched | WanPulse (per-tick) |
 | 7404 | UDP multicast 239.0.0.2 | reader→consumers | AxisPulse (locked timing) |
 | 7405 | UDP | consumers→reader | LoadFeedback |
+| 7408 | UDP loopback | glyph_intent→reader_glyph | Intent pulse (ADVISORY/DIRECTIVE/ALARM) |
 | 7410 | UDP | nazare→LMDE | CortexPulse → cortex.py |
 | 7420 | TCP (SSH tunnel) | nazare→EC2 | CortexPulse → cerebellum |
 | 7421 | TCP (SSH tunnel) | EC2→Mint | DCN pred_err_ema |
@@ -111,6 +128,24 @@ Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) �
 ---
 
 ## Files
+
+### Glyph intent layer (`glyph/`)
+
+| File | Role |
+|---|---|
+| `glyph/reader_glyph.c` | Fork of reader.c; injects `θ1+Δ` to beacon multicast during intent window |
+| `glyph/glyph_intent.py` | Fires typed intent pulses: `advisory \| directive \| alarm` |
+
+Run **instead of** `reader.c` during glyph sessions. Does not run alongside the live reader.
+
+```bash
+gcc -O2 -o glyph/reader_glyph glyph/reader_glyph.c -lm
+sudo ./glyph/reader_glyph
+
+python3 glyph/glyph_intent.py advisory
+python3 glyph/glyph_intent.py directive
+python3 glyph/glyph_intent.py alarm
+```
 
 ### Substrate (Mint + Pi)
 
