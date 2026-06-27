@@ -57,6 +57,11 @@
 #define LOAD_MAGIC    0x4C44   /* "LD" */
 #define GLYPH_MAGIC   0x474C   /* "GL" */
 
+/* ── peer addresses (filter own injections from phase tracking) ──────────── */
+#define PI1_ADDR  "10.0.0.122"
+#define PI2_ADDR  "10.0.0.174"
+#define GLYPH_DELTA 0.50f   /* rad phase advance injected on Pi1 during ACTIVE */
+
 /* ── lock params ─────────────────────────────────────────────────────────── */
 #define PHASE_TARGET  M_PI
 #define ANTI_THRESH   0.20
@@ -298,6 +303,21 @@ int main(int argc, char **argv) {
         fcntl(glyph_fd, F_SETFL, O_NONBLOCK);
     }
 
+    /* beacon injection socket — sends θ1+DELTA to perturb Pi2's coupling */
+    int inj_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in inj_addr = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(BEACON_PORT),
+        .sin_addr.s_addr = inet_addr(BEACON_GRP)
+    };
+    {
+        int ttl = 4;
+        setsockopt(inj_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        /* loop=1: glyph_rx on Mint also receives injected beacons for detection */
+        int loop = 1;
+        setsockopt(inj_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+    }
+
     /* beacon multicast receiver 7400 */
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     {
@@ -314,6 +334,9 @@ int main(int argc, char **argv) {
         struct timeval tv = {.tv_sec=0, .tv_usec=1000};
         setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
+
+    uint32_t pi1_net = inet_addr(PI1_ADDR);
+    uint32_t pi2_net = inet_addr(PI2_ADDR);
 
     double phases[3]            = {-1.0, -1.0, -1.0};
     struct timespec last_seen[3]= {{0},{0},{0}};
@@ -347,6 +370,9 @@ int main(int argc, char **argv) {
         ssize_t n = recvfrom(rx, &pkt, sizeof(pkt), 0,
                              (struct sockaddr *)&src, &slen);
         if (n != sizeof(pkt) || ntohs(pkt.magic) != BEACON_MAGIC) goto drain_load;
+        /* skip own injections — only track real beacons from the Pis */
+        if (src.sin_addr.s_addr != pi1_net && src.sin_addr.s_addr != pi2_net)
+            goto drain_load;
         int sid = pkt.sid;
         if (sid != 1 && sid != 2) goto drain_load;
         if (target_sid != 0 && sid != target_sid) goto drain_load;
@@ -411,9 +437,18 @@ int main(int argc, char **argv) {
         /* ── glyph scheduler tick ── */
         glyph_tick();
 
+        /* ── glyph beacon injection — perturb Pi2's coupling with θ1+DELTA ── */
+        if (glyph_active && sid == 1) {
+            Beacon inj;
+            memcpy(&inj, &pkt, sizeof(inj));
+            inj.theta = htonf((float)phases[1] + GLYPH_DELTA);
+            sendto(inj_fd, &inj, sizeof(inj), 0,
+                   (struct sockaddr *)&inj_addr, sizeof(inj_addr));
+        }
+
         /* ── AxisPulse → 239.0.0.2:7404 (every packet) ── */
         {
-            float out_pd_dev = glyph_active ? 0.30f : (float)pd_dev;
+            float out_pd_dev = (float)pd_dev;   /* real phase — no synthetic override */
 
             AxisPulse ap;
             ap.magic    = htons(AXIS_MAGIC);
