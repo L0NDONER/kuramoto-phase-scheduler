@@ -60,7 +60,6 @@
 /* ── peer addresses (filter own injections from phase tracking) ──────────── */
 #define PI1_ADDR  "10.0.0.122"
 #define PI2_ADDR  "10.0.0.174"
-#define GLYPH_DELTA 0.50f   /* rad phase advance injected on Pi1 during ACTIVE */
 
 /* ── lock params ─────────────────────────────────────────────────────────── */
 #define PHASE_TARGET  M_PI
@@ -71,32 +70,41 @@
 /* ── intent pulse scheduler ──────────────────────────────────────────────── */
 /*
  * Intent types (gbuf[2]):
- *   0 = ADVISORY  — 1 unit  (~100ms)  soft bias
- *   1 = DIRECTIVE — 3 units (~300ms)  strong push
- *   2 = ALARM     — 9 units (~900ms)  sustained disruption
  *
- * Each intent queues: ACTIVE(N ticks) → REST(1 unit gap).
- * Neurons respond to the real pd_dev excursion naturally.
+ *   ADVISORY  (0) — soft amplitude (0.30 rad), 1 unit (~100ms)
+ *                   slow, readable signal; neurons bias gently
+ *
+ *   DIRECTIVE (1) — full amplitude (0.50 rad), 3 units (~300ms)
+ *                   sustained push; neurons commit
+ *
+ *   ALARM     (2) — maximum amplitude (1.00 rad), 2 ticks (~25ms)
+ *                   hard fast kick; collapses attractor instantly;
+ *                   EMA saturates; every neuron feels it simultaneously;
+ *                   neurons keep bias after REST gap without further signal
+ *
+ * Each intent: ACTIVE(N ticks, delta rad) → REST(1 unit gap, delta=0).
  */
 #define INTENT_UNIT   8    /* beacon ticks per base unit (~100ms at 80Hz) */
 #define INTENT_QSIZE 64
 
-struct glyph_entry { int active; int ticks; };
+struct glyph_entry { int active; int ticks; float delta; };
 static struct glyph_entry glyph_queue[INTENT_QSIZE];
-static int gq_head = 0, gq_tail = 0, gq_remaining = 0, glyph_active = 0;
+static int   gq_head = 0, gq_tail = 0, gq_remaining = 0, glyph_active = 0;
+static float glyph_delta = 0.0f;
 
-static void gq_push(int active, int ticks) {
+static void gq_push(int active, int ticks, float delta) {
     int next = (gq_tail + 1) % INTENT_QSIZE;
     if (next == gq_head) return;
-    glyph_queue[gq_tail] = (struct glyph_entry){active, ticks};
+    glyph_queue[gq_tail] = (struct glyph_entry){active, ticks, delta};
     gq_tail = next;
 }
 static void glyph_tick(void) {
     if (gq_remaining > 0) { gq_remaining--; return; }
-    if (gq_head == gq_tail) { glyph_active = 0; return; }
+    if (gq_head == gq_tail) { glyph_active = 0; glyph_delta = 0.0f; return; }
     struct glyph_entry e = glyph_queue[gq_head];
     gq_head = (gq_head + 1) % INTENT_QSIZE;
     glyph_active = e.active;
+    glyph_delta  = e.delta;
     gq_remaining = e.ticks - 1;
 }
 
@@ -422,11 +430,11 @@ int main(int argc, char **argv) {
         /* ── glyph scheduler tick ── */
         glyph_tick();
 
-        /* ── glyph beacon injection — perturb Pi2's coupling with θ1+DELTA ── */
-        if (glyph_active && sid == 1) {
+        /* ── intent beacon injection — perturb Pi2's coupling with θ1+delta ── */
+        if (glyph_active && glyph_delta > 0.0f && sid == 1) {
             Beacon inj;
             memcpy(&inj, &pkt, sizeof(inj));
-            inj.theta = htonf((float)phases[1] + GLYPH_DELTA);
+            inj.theta = htonf((float)phases[1] + glyph_delta);
             sendto(inj_fd, &inj, sizeof(inj), 0,
                    (struct sockaddr *)&inj_addr, sizeof(inj_addr));
         }
@@ -539,9 +547,15 @@ int main(int argc, char **argv) {
                 uint16_t gmagic = ((uint16_t)gbuf[0] << 8) | gbuf[1];
                 if (gmagic != GLYPH_MAGIC) continue;
                 switch (gbuf[2]) {
-                    case 0: gq_push(1, INTENT_UNIT);   gq_push(0, INTENT_UNIT); break;
-                    case 1: gq_push(1, INTENT_UNIT*3); gq_push(0, INTENT_UNIT); break;
-                    case 2: gq_push(1, INTENT_UNIT*9); gq_push(0, INTENT_UNIT); break;
+                    case 0: /* ADVISORY: soft, 1 unit */
+                        gq_push(1, INTENT_UNIT,   0.30f);
+                        gq_push(0, INTENT_UNIT,   0.00f); break;
+                    case 1: /* DIRECTIVE: full amplitude, 3 units */
+                        gq_push(1, INTENT_UNIT*3, 0.50f);
+                        gq_push(0, INTENT_UNIT,   0.00f); break;
+                    case 2: /* ALARM: max amplitude, 2 ticks — state collapse */
+                        gq_push(1, 2,             1.00f);
+                        gq_push(0, INTENT_UNIT,   0.00f); break;
                 }
             }
         }
