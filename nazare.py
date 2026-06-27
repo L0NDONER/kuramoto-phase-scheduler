@@ -26,8 +26,9 @@ CEREBELLUM_IP   = "127.0.0.1"
 CEREBELLUM_PORT = 7420
 
 # Pi2 shaper — DCN nudge relay (LAN UDP)
-PI2_IP   = "10.0.0.174"
-PI2_PORT = 7430
+PI2_IP        = "10.0.0.174"
+PI2_PORT      = 7430   # cpuset neuron
+PI2_DVFS_PORT = 7432   # dvfs neuron
 
 # CortexPulse wire format: magic(H) X(f) Y(f) cycle(I) margin(f) — 18 bytes
 _CP_FMT   = ">HffIf"
@@ -410,11 +411,14 @@ while True:
                     data = data[_DCN_SIZE:]
                     if magic == _DCN_MAGIC:
                         _last_dcn_corr = correction
-                        # relay to pi2 shaper (LAN UDP, always — shaper gates internally)
+                        # relay to both Pi2 neurons (LAN UDP, always — shaper gates internally)
+                        _dcn_pkt = struct.pack(_DCN_FMT, _DCN_MAGIC, correction)
                         try:
-                            _cortex_sock.sendto(
-                                struct.pack(_DCN_FMT, _DCN_MAGIC, correction),
-                                (PI2_IP, PI2_PORT))
+                            _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_PORT))
+                        except OSError:
+                            pass
+                        try:
+                            _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_DVFS_PORT))
                         except OSError:
                             pass
                         if DCN_ENABLED:

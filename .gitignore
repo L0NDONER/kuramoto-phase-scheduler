@@ -15,8 +15,12 @@ reader_arm
 phase_sched_arm
 wan_receiver_arm
 
-# pi2 binary (rebuild on pi2)
+# glyph binaries
+glyph/reader_glyph
+
+# pi2 binaries (rebuild on pi2)
 pi2/pi2_reader
+pi2/pi2_dvfs_reader
 
 # runtime artefacts
 __pycache__/

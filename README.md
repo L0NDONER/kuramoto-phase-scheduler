@@ -36,6 +36,19 @@ This mirrors the biological distinction between a nerve spike (timing carrier) a
 
 Lock never broke. 4-core saturation shifted the equilibrium but did not break it. Post-stress mean φ returned to within 0.001 rad of baseline — full self-recovery.
 
+### 5. Complementary homeostasis in a two-neuron system
+
+Two substrate neurons sharing a timing and error substrate reduce thermal variance by 46% relative to uncontrolled baseline. Topology control reduces heat generation; DVFS control accelerates thermal recovery. The two mechanisms are orthogonal and non-redundant, demonstrating complementary homeostatic behaviour in a minimal artificial nervous system.
+
+| Regime | temp μ | temp σ² | peak | cool_s | commits |
+|---|---|---|---|---|---|
+| Baseline (no neurons) | 82.8°C | 6.31 | 86.2°C | 403s | — |
+| DVFS only | 83.4°C | 5.28 | 85.7°C | 310s | 3 freq steps |
+| Topology only | 83.0°C | 3.80 | 86.2°C | 332s | 3 core steps |
+| Both neurons | 83.0°C | **3.42** | **85.2°C** | 326s | 2+1 steps |
+
+Topology alone accounts for 40% variance reduction; DVFS alone 16%; together 46%. The residual gain from combining them is modest in variance terms but the mechanisms target different phases: topology suppresses the thermal rise, DVFS shortens the recovery tail. Neither neuron is redundant.
+
 ### 4. Temlum: slow integrator on a fast substrate
 
 A thermal error integrator (temlum) running on the Pi2 reader produces stable topology decisions from a noisy control signal:
@@ -92,7 +105,8 @@ Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) �
 | 7420 | TCP (SSH tunnel) | nazare→EC2 | CortexPulse → cerebellum |
 | 7421 | TCP (SSH tunnel) | EC2→Mint | DCN pred_err_ema |
 | 7430 | UDP | nazare→Pi2 | DCN relay |
-| 7431 | UDP loopback | pi2_reader→pi2_actuator | Intent (PARK/UNPARK/HOLD) |
+| 7431 | UDP loopback | pi2_reader→pi2_actuator | Intent (PARK/UNPARK/HOLD) — cpuset |
+| 7433 | UDP loopback | pi2_dvfs_reader→pi2_dvfs_actuator | Intent (PARK/UNPARK/HOLD) — cpufreq |
 
 ---
 
@@ -123,8 +137,10 @@ Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) �
 
 | File | Runs on | Role |
 |---|---|---|
-| `pi2_reader.c` | Pi2 | Sensor + temlum controller + intent emitter |
+| `pi2_reader.c` | Pi2 | Sensor + temlum controller + intent emitter → cpuset |
 | `pi2_actuator.py` | Pi2 | cgroup cpuset actuator, 15s dwell gate |
+| `pi2_dvfs_reader.c` | Pi2 | Identical neuron, intent → cpufreq |
+| `pi2_dvfs_actuator.py` | Pi2 | cpufreq actuator, 15s dwell gate |
 | `nazare.py` | (copy) | Transport reference |
 | `cerebellum_ec2.py` | (copy) | Observer reference |
 
