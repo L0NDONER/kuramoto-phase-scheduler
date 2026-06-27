@@ -39,6 +39,8 @@
 #define OMEGA_PI       0.054
 #define OMEGA_PI2      0.052
 
+#define ANCHOR_INTERVAL 200   /* re-broadcast t0_ns every N ticks (~10 s) */
+
 #define K_MIN          0.22
 #define K_MAX          0.28
 #define NOISE_AMP      0.008
@@ -47,7 +49,7 @@
 /* Lock detection */
 #define LOCK_WINDOW    20
 #define LOCK_STD       0.10
-#define ANTI_THRESH    0.20
+#define ANTI_THRESH    0.22
 
 /* PI gains */
 #define KP             0.1
@@ -89,7 +91,7 @@ static float htonf(float f) {
     uint32_t n; memcpy(&n, &f, 4); n = htonl(n);
     float r; memcpy(&r, &n, 4); return r;
 }
-static float ntohf(float f) { return htonf(f); } /* same op */
+static float ntohf(float f) { return htonf(f); } /* ntoh == hton for floats — same bit-swap */
 
 int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -192,6 +194,9 @@ int main(int argc, char *argv[]) {
 
             if (locked)
                 integral += serr * (TICK_NS / 1e9) * KI;
+            else
+                integral *= 0.999;   /* slow leak while unlocked — stale integral
+                                         shouldn't shove omega the wrong way on re-lock */
             if (integral >  INTEG_CLAMP) integral =  INTEG_CLAMP;
             if (integral < -INTEG_CLAMP) integral = -INTEG_CLAMP;
 
@@ -233,7 +238,7 @@ int main(int argc, char *argv[]) {
         out.theta = htonf((float)theta);
         out.omega = htonf((float)omega);
         out._pad  = 0;
-        out.t0_ns = (tick == 0)
+        out.t0_ns = (tick % ANCHOR_INTERVAL == 0)
             ? htobe64((uint64_t)t0.tv_sec * 1000000000ULL + (uint64_t)t0.tv_nsec)
             : 0;
         sendto(tx, &out, sizeof(out), 0,
