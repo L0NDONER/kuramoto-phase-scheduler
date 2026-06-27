@@ -41,7 +41,7 @@
 #define P_TARGET    0.0045f
 #define W_P         1.0f
 #define W_T         0.15f
-#define W_PD        0.008f
+#define W_PD        0.080f   /* signed phase deviation weight (10x bump for glyph calibration) */
 #define E_UNPARK    0.0040f
 #define E_PARK      0.0030f
 
@@ -188,8 +188,8 @@ dcn:
             else if (e_C < -E_PARK)   intent = "PARK";
             else                       intent = "HOLD";
 
-            printf("[pi2_dvfs_reader] pred=%.5f temlum=%+.3f e_C=%+.5f → %s\n",
-                   pred_err, temlum, e_C, intent);
+            printf("[pi2_dvfs_reader] pred=%.5f temlum=%+.3f pd_s=%+.4f e_C=%+.5f → %s\n",
+                   pred_err, temlum, pd_signed, e_C, intent);
             fflush(stdout);
 
             sendto(intent_fd, intent, strlen(intent), 0,

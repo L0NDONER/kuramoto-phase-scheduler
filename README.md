@@ -66,15 +66,44 @@ An intent signal is not a packet. It is a phase-space event: a deformation of th
 
 The axis node (`reader_glyph.c`) injects a spoofed Pi1 beacon with `θ1 + Δ` during an intent window. Pi2's Kuramoto coupling responds to the perturbed phase. Every downstream consumer sees the real `pd_dev` excursion in AxisPulse — the signal propagates through actual coupling dynamics.
 
-Three intent types, distinguished by amplitude and duration:
+Four intent types, distinguished by amplitude, duration, and sign:
 
-| Intent | Δ (rad) | Duration | pd_dev observed | Effect |
-|---|---|---|---|---|
-| ADVISORY | 0.30 | 1 unit (~100ms) | ~0.30 | Soft bias, readable excursion |
-| DIRECTIVE | 0.50 | 3 units (~300ms) | ~0.50 | Sustained push, neurons commit |
-| ALARM | 1.00 | 2 ticks (~25ms) | **1.035** | Attractor collapsed, field rings to baseline |
+| Intent | Δ (rad) | Duration | pd_dev | Direction | Effect |
+|---|---|---|---|---|---|
+| ADVISORY | +0.30 | 1 unit (~100ms) | ~0.03 | PARK | Soft bias |
+| DIRECTIVE | +0.50 | 3 units (~300ms) | ~0.05 | PARK | Sustained push |
+| ALARM | +1.00 | 2 ticks (~25ms) | **1.035** | PARK | Attractor collapse, self-re-lock |
+| BOOST | −0.40 | 3 units (~300ms) | ~0.08 | UNPARK | Negative delta, pd below π |
 
-The alarm overshots the π basin entirely — pd_dev exceeded π/3, coherence collapsed, the system re-locked on its own. The shape of the perturbation is the instruction. Neurons respond to the excursion the same way they respond to any phase deviation: no if-else, no decode, no routing. DCN sends error corrections top-down. Glyphs inject intent bottom-up through the oscillator field.
+Sign matters. Positive Δ: Pi2 coupling drives θ2 up → pd above π → pd_signed positive → e_C decreases (PARK). Negative Δ: Pi2 coupling drives θ2 down → pd below π → pd_signed negative → e_C increases (UNPARK). The direction is set by `sin(θ1_fake − θ2)` in beacon.c's Kuramoto law.
+
+BOOST amplitude is bounded by the nazare DRIFT_THRESH (0.25). At −1.50 rad, pd_dev reaches 0.30 > threshold, triggering stability decay that zeroes the CortexPulse pathway and silences cerebellum pred_err. At −0.40 rad, pd_dev ≈ 0.08 — well within threshold and the DCN pathway stays live.
+
+### 7. Glyph v1 calibration — boundary behaviour under DCN + BOOST
+
+With `W_PD = 0.080` (signed phase deviation weight in pi2_reader / pi2_dvfs_reader), a live temperature sweep was run to hover Pi2 near T_target (84°C) with DCN active.
+
+At the boundary (|temlum| < 0.1, i.e. T within ~0.5°C of target):
+
+```
+temlum=+0.019  pd_s=−0.014  e_C=−0.011  → PARK     (no glyph)
+temlum=+0.019  pd_s=−0.080  e_C=+0.002  → HOLD     (BOOST active)
+```
+
+BOOST shifted e_C by +0.013, crossing E_PARK (−0.003) into HOLD. Not enough amplitude to reach E_UNPARK (+0.004) in a single pulse — a PARK→HOLD transition, not PARK→UNPARK.
+
+No oscillation. No runaway. Once temlum > 0.1, thermal dominates and BOOST is inert. BOOST is a modulator, not a command.
+
+**v1 stable parameters:**
+
+| Parameter | Value | Notes |
+|---|---|---|
+| W_PD | 0.080 | 10× original; glyph signal lands at intent thresholds |
+| BOOST Δ | −0.40 rad | pd_dev ≈ 0.08; DRIFT_THRESH safe margin |
+| BOOST duration | 3 units (~300ms) | Sufficient dwell for DCN tick to sample |
+| Active band | ±0.5°C of T_target | Outside this, thermal term dominates |
+
+Next: two-pulse BOOST sequence (HOLD then nudge) or raise W_PD further to achieve full PARK→UNPARK flip in the active band.
 
 ---
 

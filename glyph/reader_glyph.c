@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
         glyph_tick();
 
         /* ── intent beacon injection — perturb Pi2's coupling with θ1+delta ── */
-        if (glyph_active && glyph_delta > 0.0f && sid == 1) {
+        if (glyph_active && glyph_delta != 0.0f && sid == 1) {
             Beacon inj;
             memcpy(&inj, &pkt, sizeof(inj));
             inj.theta = htonf((float)phases[1] + glyph_delta);
@@ -556,9 +556,9 @@ int main(int argc, char **argv) {
                     case 2: /* ALARM: max positive, 2 ticks — attractor collapse */
                         gq_push(1, 2,             1.00f);
                         gq_push(0, INTENT_UNIT,   0.00f); break;
-                    case 3: /* BOOST: negative, 1 unit — pd below π → UNPARK bias */
-                        gq_push(1, INTENT_UNIT,  -0.30f);
-                        gq_push(0, INTENT_UNIT,   0.00f); break;
+                    case 3: /* BOOST: negative, 3 units — pd below π, stays under DRIFT_THRESH */
+                        gq_push(1, INTENT_UNIT*3, -0.40f);
+                        gq_push(0, INTENT_UNIT,    0.00f); break;
                 }
             }
         }
