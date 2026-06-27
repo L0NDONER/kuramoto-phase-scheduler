@@ -1,0 +1,27 @@
+# built binaries
+beacon
+cpu_reader
+entropy_reader
+gpu_reader
+phase_sched
+tc_shaper
+tm1_reader
+wan_receiver
+reader
+count1b
+
+# ARM cross-compiled
+reader_arm
+phase_sched_arm
+wan_receiver_arm
+
+# pi2 binary (rebuild on pi2)
+pi2/pi2_reader
+
+# runtime artefacts
+__pycache__/
+*.pyc
+memory/
+*.csv
+*.png
+*.log
