@@ -68,49 +68,34 @@
 #define LOCK_WINDOW   20
 #define LOCK_STD      0.10
 
-/* ── Morse / glyph scheduler ─────────────────────────────────────────────── */
-#define GLYPH_UNIT    8    /* beacon ticks per DIT */
-#define GLYPH_QSIZE 512
+/* ── intent pulse scheduler ──────────────────────────────────────────────── */
+/*
+ * Intent types (gbuf[2]):
+ *   0 = ADVISORY  — 1 unit  (~100ms)  soft bias
+ *   1 = DIRECTIVE — 3 units (~300ms)  strong push
+ *   2 = ALARM     — 9 units (~900ms)  sustained disruption
+ *
+ * Each intent queues: ACTIVE(N ticks) → REST(1 unit gap).
+ * Neurons respond to the real pd_dev excursion naturally.
+ */
+#define INTENT_UNIT   8    /* beacon ticks per base unit (~100ms at 80Hz) */
+#define INTENT_QSIZE 64
 
-static const char *morse_tbl[128] = {
-    ['A']=".-",   ['B']="-...", ['C']="-.-.", ['D']="-..",
-    ['E']=".",    ['F']="..-.", ['G']="--.",  ['H']="....",
-    ['I']="..",   ['J']=".---", ['K']="-.-",  ['L']=".-..",
-    ['M']="--",   ['N']="-.",   ['O']="---",  ['P']=".--.",
-    ['Q']="--.-", ['R']=".-.",  ['S']="...",  ['T']="-",
-    ['U']="..-",  ['V']="...-", ['W']=".--",  ['X']="-..-",
-    ['Y']="-.--", ['Z']="--..",
-    ['0']="-----",['1']=".----",['2']="..---",['3']="...--",
-    ['4']="....-",['5']=".....",['6']="-....",['7']="--...",
-    ['8']="---..",['9']="----.",
-};
 struct glyph_entry { int active; int ticks; };
-static struct glyph_entry glyph_queue[GLYPH_QSIZE];
+static struct glyph_entry glyph_queue[INTENT_QSIZE];
 static int gq_head = 0, gq_tail = 0, gq_remaining = 0, glyph_active = 0;
 
 static void gq_push(int active, int ticks) {
-    int next = (gq_tail + 1) % GLYPH_QSIZE;
+    int next = (gq_tail + 1) % INTENT_QSIZE;
     if (next == gq_head) return;
     glyph_queue[gq_tail] = (struct glyph_entry){active, ticks};
     gq_tail = next;
-}
-static void gq_enqueue_char(char c) {
-    if (c >= 'a' && c <= 'z') c -= 32;
-    if (c == ' ') { gq_push(0, GLYPH_UNIT * 7); return; }
-    unsigned char uc = (unsigned char)c;
-    if (uc >= 128 || !morse_tbl[uc]) return;
-    const char *code = morse_tbl[uc];
-    for (int i = 0; code[i]; i++) {
-        gq_push(1, code[i] == '-' ? GLYPH_UNIT * 3 : GLYPH_UNIT);
-        if (code[i+1]) gq_push(0, GLYPH_UNIT);
-    }
-    gq_push(0, GLYPH_UNIT * 3);
 }
 static void glyph_tick(void) {
     if (gq_remaining > 0) { gq_remaining--; return; }
     if (gq_head == gq_tail) { glyph_active = 0; return; }
     struct glyph_entry e = glyph_queue[gq_head];
-    gq_head = (gq_head + 1) % GLYPH_QSIZE;
+    gq_head = (gq_head + 1) % INTENT_QSIZE;
     glyph_active = e.active;
     gq_remaining = e.ticks - 1;
 }
@@ -546,14 +531,18 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ── drain glyph char events (non-blocking) ── */
+        /* ── drain intent packets (non-blocking) ── */
         {
             uint8_t gbuf[8];
             ssize_t gn;
             while ((gn = recv(glyph_fd, gbuf, sizeof(gbuf), 0)) >= 3) {
                 uint16_t gmagic = ((uint16_t)gbuf[0] << 8) | gbuf[1];
                 if (gmagic != GLYPH_MAGIC) continue;
-                gq_enqueue_char((char)gbuf[2]);
+                switch (gbuf[2]) {
+                    case 0: gq_push(1, INTENT_UNIT);   gq_push(0, INTENT_UNIT); break;
+                    case 1: gq_push(1, INTENT_UNIT*3); gq_push(0, INTENT_UNIT); break;
+                    case 2: gq_push(1, INTENT_UNIT*9); gq_push(0, INTENT_UNIT); break;
+                }
             }
         }
     }
