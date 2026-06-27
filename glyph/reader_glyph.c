@@ -547,14 +547,17 @@ int main(int argc, char **argv) {
                 uint16_t gmagic = ((uint16_t)gbuf[0] << 8) | gbuf[1];
                 if (gmagic != GLYPH_MAGIC) continue;
                 switch (gbuf[2]) {
-                    case 0: /* ADVISORY: soft, 1 unit */
+                    case 0: /* ADVISORY: soft positive, 1 unit — mild PARK bias */
                         gq_push(1, INTENT_UNIT,   0.30f);
                         gq_push(0, INTENT_UNIT,   0.00f); break;
-                    case 1: /* DIRECTIVE: full amplitude, 3 units */
+                    case 1: /* DIRECTIVE: full positive, 3 units — strong PARK */
                         gq_push(1, INTENT_UNIT*3, 0.50f);
                         gq_push(0, INTENT_UNIT,   0.00f); break;
-                    case 2: /* ALARM: max amplitude, 2 ticks — state collapse */
+                    case 2: /* ALARM: max positive, 2 ticks — attractor collapse */
                         gq_push(1, 2,             1.00f);
+                        gq_push(0, INTENT_UNIT,   0.00f); break;
+                    case 3: /* BOOST: negative, 1 unit — pd below π → UNPARK bias */
+                        gq_push(1, INTENT_UNIT,  -0.30f);
                         gq_push(0, INTENT_UNIT,   0.00f); break;
                 }
             }

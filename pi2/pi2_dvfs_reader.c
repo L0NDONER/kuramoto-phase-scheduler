@@ -41,6 +41,7 @@
 #define P_TARGET    0.0045f
 #define W_P         1.0f
 #define W_T         0.15f
+#define W_PD        0.008f
 #define E_UNPARK    0.0040f
 #define E_PARK      0.0030f
 
@@ -130,8 +131,9 @@ int main(int argc, char **argv) {
         .sin_addr.s_addr = inet_addr(intent_ip),
     };
 
-    float temlum   = 0.0f;
-    float pred_err = P_TARGET;
+    float temlum    = 0.0f;
+    float pred_err  = P_TARGET;
+    float pd_signed = 0.0f;
     uint32_t last_tick = UINT32_MAX;
 
     printf("[pi2_dvfs_reader] T_target=%.1f P_target=%.4f dcn=:%d intent=%s:%d\n",
@@ -161,6 +163,9 @@ int main(int argc, char **argv) {
             if (!locked || tick == last_tick) goto dcn;
             last_tick = tick;
 
+            float pd = be_float(buf + 16);
+            pd_signed = pd - (float)M_PI;
+
             float T = read_temp();
             float e_T = T - T_TARGET;
             temlum = ALPHA_T * temlum + (1.0f - ALPHA_T) * e_T;
@@ -176,7 +181,7 @@ dcn:
             pred_err = be_float(buf + 2);
 
             float e_P = pred_err - P_TARGET;
-            float e_C = W_P * e_P - W_T * temlum;
+            float e_C = W_P * e_P - W_PD * pd_signed - W_T * temlum;
 
             const char *intent;
             if      (e_C >  E_UNPARK) intent = "UNPARK";

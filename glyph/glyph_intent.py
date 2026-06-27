@@ -13,6 +13,7 @@ Usage:
   python3 glyph/glyph_intent.py advisory
   python3 glyph/glyph_intent.py directive
   python3 glyph/glyph_intent.py alarm
+  python3 glyph/glyph_intent.py boost
 """
 import socket, struct, sys
 
@@ -23,8 +24,9 @@ MAGIC      = 0x474C
 ADVISORY  = 0
 DIRECTIVE = 1
 ALARM     = 2
+BOOST     = 3
 
-NAMES = {"advisory": ADVISORY, "directive": DIRECTIVE, "alarm": ALARM}
+NAMES = {"advisory": ADVISORY, "directive": DIRECTIVE, "alarm": ALARM, "boost": BOOST}
 
 def send(intent: int):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
