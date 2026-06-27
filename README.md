@@ -1,180 +1,173 @@
-# Kuramoto Phase Scheduler
+# Kuramoto Substrate
 
-A self-synchronising phase-lock mesh for home network traffic shaping. Two nodes run a repulsive Kuramoto coupling loop over UDP multicast, converge to anti-phase (φ≈π), and coordinate tc burst windows without a shared clock or central controller. Additional nodes join as phase-readers — they time their own WAN traffic from the oscillator pair without perturbing the lock.
+A self-synchronising oscillator pair used as a timing substrate for a three-tier cerebellar learning stack and a closed-loop thermal regulator.
 
-## Benchmark results
+Two Raspberry Pis run repulsive Kuramoto coupling over UDP multicast, converge to anti-phase (φ≈π), and distribute stable timing to downstream consumers via a Mint axis node. No shared clock. No central controller.
 
-All runs on Raspberry Pi ↔ Pi2 over a home LAN, 20 Hz tick rate. No external time reference.
+---
 
-| Condition | Ticks | Locked | mean φ | σ (rad) | Δ from π |
-|---|---|---|---|---|---|
-| Pi↔Pi2 baseline | 201 | **100%** | 3.1017 | 0.0173 | 1.27% |
-| Pi↔Pi2 + Mint (3-node coupled) | 483 | **100%** | 3.1114 | 0.0165 | 0.96% |
-| Pi2 under 4-core CPU load | 337 | **100%** | 2.9236 | 0.0285 | 6.94% |
-| Post-stress recovery | 231 | **100%** | 3.1023 | 0.0204 | 1.25% |
-| Pi↔Pi2 + Mint as reader | 20 | **100%** | 3.130 | 0.009 | 0.36% |
+## Findings
 
-Key observations:
-- Lock never broke across all conditions including Mint joining/leaving as a reader
-- Mint dropout and rejoin has zero effect on the Pi↔Pi2 lock
-- Reader topology (Mint passive) is tighter than 3-node coupled — no third oscillator perturbing equilibrium
-- 4-core CPU saturation shifted the equilibrium point but did not break lock
-- Post-stress mean φ returned to within 0.001 rad of baseline — full self-recovery
+### 1. DCN eliminates thermal variance
 
-## Concept
+A deep cerebellar nucleus (DCN) correction signal was applied to an LMDE host running a controlled 30% CPU load. Ten episodes per regime, matched conditions.
+
+| Regime | temp μ | temp σ² |
+|---|---|---|
+| DCN=OFF | 48.05°C | 0.051 |
+| DCN=ON  | 48.00°C | 0.000 |
+
+Mean is unchanged. Variance is eliminated. The DCN loop does not regulate the mean — it damps pathway surges, producing homeostatic temperature stability. Phase deviation (pd_dev) was indistinguishable between regimes, confirming the correction acts on the thermal pathway, not the oscillator.
+
+### 2. Signal vs actuation separation
+
+The cerebellum sends timing only. It does not inject energy into the actuator. Proved by a null experiment on Pi2 at 30% load: DCN corrections arrived, were received, and produced no thermal effect — because at 30% load there was no actuatable lever. The signal is present; without a plant to act on, nothing moves.
+
+This mirrors the biological distinction between a nerve spike (timing carrier) and the current that stiffens a muscle (energy from the plant). The cerebellum modulates gain. The actuator energy comes from the load itself.
+
+### 3. Stable lock under perturbation
+
+| Condition | Ticks | Locked | mean φ | σ (rad) |
+|---|---|---|---|---|
+| Pi↔Pi2 baseline | 201 | 100% | 3.1017 | 0.0173 |
+| Pi↔Pi2 + Mint (3-node coupled) | 483 | 100% | 3.1114 | 0.0165 |
+| Pi2 under 4-core CPU load | 337 | 100% | 2.9236 | 0.0285 |
+| Post-stress recovery | 231 | 100% | 3.1023 | 0.0204 |
+
+Lock never broke. 4-core saturation shifted the equilibrium but did not break it. Post-stress mean φ returned to within 0.001 rad of baseline — full self-recovery.
+
+### 4. Temlum: slow integrator on a fast substrate
+
+A thermal error integrator (temlum) running on the Pi2 reader produces stable topology decisions from a noisy control signal:
 
 ```
-Pi ──── repulsive Kuramoto ──── Pi2
-         (oscillators)
-
-Mint: reads Pi+Pi2 phase → times own tc drain → never transmits
-Firestick: reads Pi+Pi2 phase → phase-reader at axis
+temlum = 0.95·temlum_prev + 0.05·(T − T_target)
+e_C    = 1.0·(pred_err − 0.0045) − 0.15·temlum
 ```
 
-Pi and Pi2 own the lock. Mint and Firestick are consumers of that ground truth. Readers can be added or removed without touching the oscillator pair.
+The AxisPulse substrate (~40Hz) paces the temlum update. The cerebellar pred_err arrives at ~1Hz. The actuator only commits a topology change after a 15-second sustained-majority vote. Three timescales — substrate, signal, actuation — are cleanly separated, preventing chatter without losing responsiveness.
 
-Each oscillator broadcasts its phase at 20 Hz over UDP multicast and applies the Kuramoto coupling step:
-
-```
-dθ_i = ω_i - K · Σ sin(θ_i - θ_j) + noise
-```
-
-When locked at φ≈π, drain windows on each node are coordinated — bursts never collide on the uplink.
-
-## Files
-
-### `beacon.py`
-
-Runs on Pi and Pi2 (oscillators). Each node:
-
-1. Broadcasts a phase beacon (`239.0.0.1:7400`) at 20 Hz
-2. Reads remote beacons and applies repulsive Kuramoto coupling
-3. Converges to anti-phase via adaptive K and jitter-gated frequency tracker (ω gain 0.001)
-4. Detects statistical lock (std gate over 20-tick rolling window)
-5. Pi only: opens a 500k burst window on `tc class 1:20` at each drain crossing
-
-Pi2 coupling rule: couples to Mint only when Mint is alive. Coupling to the anti-phase Mint+Pi pair cancels to zero — avoided by design.
-
-**Run:**
-```bash
-python3 beacon.py pi     # Raspberry Pi shaper (requires root for tc)
-python3 beacon.py pi2    # Second Raspberry Pi
-```
-
-**As a service:**
-```bash
-sudo systemctl enable --now kuramoto-beacon
-```
-
-### `reader.py`
-
-Runs on Mint (phase-reader). Never transmits a beacon. Never applies coupling. Purely observes Pi↔Pi2 and times Mint's own WAN traffic from their phase.
-
-1. Joins multicast group, receives Pi(1) + Pi2(2) beacons only
-2. Tracks Pi↔Pi2 phase gap
-3. Detects drain crossing (phase_diff descends through PHASE_TARGET)
-4. Opens 500k burst window on local HTB class 1:20 for 200ms
-5. No feedback into the mesh — Pi↔Pi2 lock is undisturbed
-
-**HTB setup required on Mint's interface before first run:**
-```bash
-sudo tc qdisc replace dev enp0s31f6 root handle 1: htb default 20
-sudo tc class add dev enp0s31f6 parent 1: classid 1:20 htb rate 5mbit ceil 5mbit burst 64k
-sudo tc qdisc add dev enp0s31f6 parent 1:20 handle 20: sfq perturb 10
-```
-
-**As a service:**
-```bash
-sudo systemctl enable --now kuramoto-beacon   # ExecStart points to reader.py
-```
-
-### `bench.py`
-
-Passive multicast listener for statistical benchmarks. Joins the beacon group without transmitting, records phase samples, and prints mean/std/min/max/lock% at the end.
-
-```bash
-python3 bench.py pi2 120   # watch pi2 for 120 seconds
-```
-
-### `turtle_sim.py`
-
-Visual simulation. Shows Mint (cyan) and Pi (orange) orbiting anti-phase, Firestick (red) at the axis, phase-diff trace, and drain pulse ring. Switches to live beacon data automatically when beacons are detected on the LAN. Shows `● LIVE`, `◑ LIVE/SIM`, or `○ SIM` mode indicator.
-
-```bash
-python3 turtle_sim.py
-```
+---
 
 ## Architecture
 
 ```
-beacon.py (Pi, id=1)            beacon.py (Pi2, id=2)
-  θ₁ ──── UDP mcast 20Hz ─────► coupling Σ sin(θ₂ - θⱼ)
-  θ₁ ◄──── UDP mcast 20Hz ────  θ₂
-
-  Kuramoto step:
-    dθ = ω - K·Σsin(θ - θⱼ) + noise
-    K  = 0.12–0.16 adaptive (stronger when far from target)
-    ω  = adaptive via jitter-gated frequency tracker
-
-  Pi/Pi2:
-    drain crossing → ThreadPoolExecutor → tc class change
-                                          burst 64k → 500k → 64k (~200ms)
-
-reader.py (Mint)
-  Receives Pi + Pi2 beacons — no transmit
-  phase_diff = |θ₁ - θ₂| wrapped to [0, π]
-  drain crossing → tc class change on enp0s31f6
-                   burst 64k → 500k → 64k (~200ms)
+Pi1 (beacon.c, sid=1)          Pi2 (beacon.c, sid=2)
+  └──── UDP multicast 239.0.0.1:7400 ────┘
+                    ↓
+           Mint reader.c  (axis node)
+           AxisPulse → 239.0.0.2:7404  (~40Hz, locked=1 when Δφ≈π)
+                    ↓
+           Mint nazare.py  (transport + staging)
+           CortexPulse → LMDE cortex.py   :7410 UDP  (α=0.02, ~50 events)
+                       → EC2  cerebellum  :7420 TCP  (α=0.005, ~289 events)
+                    ↑
+           DCN pred_err_ema ← EC2 cerebellum (reverse SSH tunnel :7421)
+                    ↓ UDP relay
+           Pi2 pi2_reader.c  (temlum controller)
+           intent → 127.0.0.1:7431
+                    ↓
+           Pi2 pi2_actuator.py  (cgroup cpuset + stress-ng)
 ```
 
-## Beacon packet (16 bytes)
+**Timescale separation:**
+- Substrate tick: 25ms (40Hz AxisPulse)
+- Cerebellar observation: ~1Hz (every 20 events)
+- Topology commit: 15s minimum dwell
 
-```
-magic   u16   0x1B4A
-sender  u8    1=Pi  2=Pi2
-tick    u32   monotonic counter
-theta   f32   current phase (0–2π)
-omega   f32   natural frequency (rad/tick)
-pad     u8
-```
+**Signal flow — read-only boundary:**
+Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) — no correction, no setpoint. The pi2_reader owns all control logic. The cerebellum cannot actuate anything directly.
 
-## Node IDs and frequencies
+---
 
-| Role | ID | ω (rad/tick) | Mode |
+## Port map
+
+| Port | Protocol | Direction | Purpose |
 |---|---|---|---|
-| pi | 1 | 0.056 | oscillator |
-| pi2 | 2 | 0.052 | oscillator |
-| mint | — | — | reader |
+| 7400 | UDP multicast 239.0.0.1 | Pi1↔Pi2 | Beacon (oscillators) |
+| 7403 | UDP loopback | reader→phase_sched | WanPulse (per-tick) |
+| 7404 | UDP multicast 239.0.0.2 | reader→consumers | AxisPulse (locked timing) |
+| 7405 | UDP | consumers→reader | LoadFeedback |
+| 7410 | UDP | nazare→LMDE | CortexPulse → cortex.py |
+| 7420 | TCP (SSH tunnel) | nazare→EC2 | CortexPulse → cerebellum |
+| 7421 | TCP (SSH tunnel) | EC2→Mint | DCN pred_err_ema |
+| 7430 | UDP | nazare→Pi2 | DCN relay |
+| 7431 | UDP loopback | pi2_reader→pi2_actuator | Intent (PARK/UNPARK/HOLD) |
 
-Small asymmetry in ω is required for the Kuramoto attractor to exist. Lock point: `φ_lock = π − arcsin(Δω / 2K)`.
+---
 
-## Graceful degradation
+## Files
 
-- If a peer drops, its slot times out after 500ms and coupling continues over remaining live peers
-- If all peers drop, the node free-runs at its natural ω and rebroadcasts — relock is automatic on reconnect
-- Mint (reader) joining or leaving has zero effect on Pi↔Pi2 lock
-- PID file at `/tmp/beacon-{role}.pid` prevents accidental duplicate instances
+### Substrate (Mint + Pi)
 
-## Jitter gate
+| File | Runs on | Role |
+|---|---|---|
+| `beacon.c` | Pi1, Pi2 | Kuramoto oscillator, tc drain |
+| `reader.c` | Mint | Axis node, distributes AxisPulse |
+| `cpu_reader.c` | Mint | DVFS consumer (cpufreq + MSR voltage) |
+| `tc_shaper.c` | Mint | WAN egress rate modulator |
+| `tm1_reader.c` | LMDE | TM1 clock duty-cycle consumer |
+| `entropy_reader.c` | Mint | Phase → /dev/urandom entropy injection |
+| `phase_sched.c` | Mint | Thundering herd suppressor |
+| `wan_receiver.c` | Mint | WanPulse decoder |
 
-The ω tracker rejects frequency updates when the peer's wall-clock beacon interval deviates >30% from the expected 50ms. This prevents load-induced tick jitter from corrupting the natural frequency estimate and drifting the equilibrium away from π.
+### Cerebellar stack
 
-## Third-device integration (Firestick / additional readers)
+| File | Runs on | Role |
+|---|---|---|
+| `nazare.py` | Mint | Transport + staging layer |
+| `cortex.py` | LMDE | Fast EMA integrator (α=0.02) |
+| `pi2/cerebellum_ec2.py` | EC2 | Deep slow integrator (α=0.005), pure observer |
 
-Subscribe to `239.0.0.1:7400`, receive Pi+Pi2 beacons, track the gap:
+### Pi2 thermal regulator (`pi2/`)
 
-```python
-gap_theta = (theta_pi + theta_pi2) / 2
-error     = wrap(gap_theta - theta_local)
-theta_local += alpha * error   # follow, don't oscillate
-# drain when abs(error) < threshold
+| File | Runs on | Role |
+|---|---|---|
+| `pi2_reader.c` | Pi2 | Sensor + temlum controller + intent emitter |
+| `pi2_actuator.py` | Pi2 | cgroup cpuset actuator, 15s dwell gate |
+| `nazare.py` | (copy) | Transport reference |
+| `cerebellum_ec2.py` | (copy) | Observer reference |
+
+---
+
+## Reproducing the Pi2 thermal regulator
+
+**Prerequisites:** SSH tunnel up, cerebellum running on EC2, nazare running on Mint.
+
+```bash
+# 1. SSH tunnel (Mint)
+ssh -fNL 7420:localhost:7420 -R 7421:localhost:7421 -o ExitOnForwardFailure=no aws
+
+# 2. Cerebellum (EC2)
+nohup python3 ~/cerebellum_ec2.py > ~/cerebellum.log 2>&1 &
+
+# 3. Nazare (Mint)
+nohup python3 -u ~/claude/nazare.py > /tmp/nazare.log 2>&1 &
+
+# 4. Build and deploy reader to Pi2
+scp pi2/pi2_reader.c pi2:~
+ssh pi2 "gcc -O2 -o ~/pi2_reader ~/pi2_reader.c -lm"
+
+# 5. Start on Pi2
+ssh pi2 "sudo sh -c '/home/pi/pi2_reader > /home/pi/pi2_reader.log 2>&1 &'"
+ssh pi2 "sudo sh -c 'python3 /home/pi/pi2_actuator.py > /home/pi/pi2_actuator.log 2>&1 &'"
 ```
 
-No feedback into the mesh. Phase-reader only.
+**Watch it:**
+```bash
+ssh pi2 "tail -f /home/pi/pi2_actuator.log"   # topology commits
+ssh pi2 "tail -f /home/pi/pi2_reader.log"      # e_C + intent per DCN tick
+```
 
-## Requirements
+**Tunnel keep-alive note:** the SSH tunnel drops silently. If the reader log goes quiet, restart the tunnel and kill/restart cerebellum so it reconnects.
 
-- Python 3.8+
-- stdlib only (`socket`, `struct`, `statistics`, `math`)
-- Root on Pi/Pi2/Mint for `tc` calls
-- Multicast-capable LAN (`239.0.0.1/8`)
+---
+
+## Build
+
+```bash
+make          # builds all C binaries
+make beacon   # individual target
+```
+
+Cross-compiled ARM binaries (`reader_arm`, `phase_sched_arm`, `wan_receiver_arm`) are built separately for deployment to Pi.
