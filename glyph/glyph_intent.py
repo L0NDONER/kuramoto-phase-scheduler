@@ -14,6 +14,7 @@ Usage:
   python3 glyph/glyph_intent.py directive
   python3 glyph/glyph_intent.py alarm
   python3 glyph/glyph_intent.py boost
+  python3 glyph/glyph_intent.py boost2
 """
 import socket, struct, sys
 
@@ -25,8 +26,9 @@ ADVISORY  = 0
 DIRECTIVE = 1
 ALARM     = 2
 BOOST     = 3
+BOOST2    = 4
 
-NAMES = {"advisory": ADVISORY, "directive": DIRECTIVE, "alarm": ALARM, "boost": BOOST}
+NAMES = {"advisory": ADVISORY, "directive": DIRECTIVE, "alarm": ALARM, "boost": BOOST, "boost2": BOOST2}
 
 def send(intent: int):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -35,7 +37,7 @@ def send(intent: int):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1].lower() not in NAMES:
-        print(f"usage: {sys.argv[0]} advisory|directive|alarm")
+        print(f"usage: {sys.argv[0]} advisory|directive|alarm|boost|boost2")
         sys.exit(1)
     intent = NAMES[sys.argv[1].lower()]
     send(intent)

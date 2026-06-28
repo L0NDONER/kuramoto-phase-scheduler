@@ -38,7 +38,7 @@
 #define P_TARGET    0.0045f
 #define W_P         1.0f
 #define W_T         0.15f
-#define W_PD        0.080f   /* signed phase deviation weight (10x bump for glyph calibration) */
+#define W_PD        0.080f   /* signed phase deviation weight */
 #define E_UNPARK    0.0040f
 #define E_PARK      0.0030f
 

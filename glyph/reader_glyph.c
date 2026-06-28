@@ -559,6 +559,11 @@ int main(int argc, char **argv) {
                     case 3: /* BOOST: negative, 3 units — pd below π, stays under DRIFT_THRESH */
                         gq_push(1, INTENT_UNIT*3, -0.40f);
                         gq_push(0, INTENT_UNIT,    0.00f); break;
+                    case 4: /* BOOST2: two-pulse — first kick shifts Pi2, second lands while lock recovers */
+                        gq_push(1, INTENT_UNIT*3, -0.40f);
+                        gq_push(0, INTENT_UNIT,    0.00f);
+                        gq_push(1, INTENT_UNIT*3, -0.40f);
+                        gq_push(0, INTENT_UNIT,    0.00f); break;
                 }
             }
         }
