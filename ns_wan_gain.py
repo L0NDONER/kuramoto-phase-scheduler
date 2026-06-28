@@ -40,7 +40,7 @@ G_MIN        = 0.0          # G at full thermal stress (floor from RATE_MIN)
 G_BASE       = 0.30         # minimum gain at carrier trough (30% × RATE range)
 HEADROOM     = 1.5          # °C above T_TARGET for full thermal compression
 EC_SCALE     = 0.05         # e_C range for ±15% bias
-PD_POP_SCALE = 0.10         # pd_pop magnitude for full mod depth
+EC_MOD_SCALE = 0.02         # e_C for full mod depth (E_UNPARK=0.004, headroom ~5×)
 
 # EMA alphas for thermal (asymmetric: slow attack, fast release)
 ALPHA_ATTACK  = 0.05
@@ -115,7 +115,6 @@ def main():
 
     temlum_ema = 0.0
     e_C_ema    = 0.0
-    pd_pop_ema = 0.0
     last_step  = -1
     last_intent = 1
 
@@ -129,9 +128,8 @@ def main():
             magic, e_C, temlum, pd_pop, intent = struct.unpack(NS_FMT, raw[:NS_SIZE])
             if magic == NS_MAGIC:
                 a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
-                temlum_ema  = a * temlum + (1 - a) * temlum_ema
-                e_C_ema     = 0.10 * e_C + 0.90 * e_C_ema
-                pd_pop_ema  = 0.20 * pd_pop + 0.80 * pd_pop_ema
+                temlum_ema = a * temlum + (1 - a) * temlum_ema
+                e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
 
         # -- wait for a locked AxisPulse tick --
         try:
@@ -149,7 +147,7 @@ def main():
 
         # -- compute G_WAN --
         carrier    = (1.0 - math.cos(theta1)) / 2.0
-        mod_depth  = min(1.0, abs(pd_pop_ema) / PD_POP_SCALE)
+        mod_depth  = min(1.0, max(0.0, e_C_ema) / EC_MOD_SCALE)
         t          = max(0.0, min(1.0, temlum_ema / HEADROOM))
         thermal    = 1.0 - t * (1.0 - G_MIN)
         ec_bias    = max(-0.15, min(0.15, e_C_ema / EC_SCALE * 0.15))
@@ -165,7 +163,7 @@ def main():
             set_rate(rate_mbit)
             last_step = step
             print(f"[ns_wan_gain] θ={theta1:.3f} carrier={carrier:.3f} "
-                  f"pd_pop={pd_pop_ema:+.4f} temlum={temlum_ema:+.3f} "
+                  f"e_C={e_C_ema:+.5f} temlum={temlum_ema:+.3f} "
                   f"G={G_WAN:.3f} → {rate_mbit}Mbit", flush=True)
 
 
