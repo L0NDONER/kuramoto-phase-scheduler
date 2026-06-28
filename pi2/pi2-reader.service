@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi2 trineuron Triangle A (cpuset controller)
+After=network-online.target reader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/pi2_reader
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
