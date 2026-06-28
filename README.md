@@ -2,7 +2,13 @@
 
 A self-synchronising oscillator pair used as a timing substrate for a three-tier cerebellar learning stack, a closed-loop thermal regulator, and a phase-space intent signalling layer.
 
-Two Raspberry Pis run repulsive Kuramoto coupling over UDP multicast, converge to anti-phase (φ≈π), and distribute stable timing to downstream consumers via a Mint axis node. No shared clock. No central controller.
+Two Raspberry Pis run repulsive Kuramoto coupling over UDP multicast, converge to anti-phase (φ≈π), and distribute stable timing to downstream consumers. No shared clock. No central controller.
+
+**Role boundaries:**
+- **Pi2** — substrate host: both Kuramoto oscillators, axis reader, and both trineuron triangles run here. Self-contained; no cross-host multicast dependencies in the oscillator layer.
+- **Pi1** — pure actuator: receives intent via NucleusState and executes `tc HTB` ceiling changes on eth0. Does not originate timing, does not participate in oscillator semantics, does not host substrate processes.
+- **Mint** — transport + WAN actuation: nazare.py stages CortexPulse to cerebellum and relays DCN/HOLD to Pi2; ns_wan_gain.py modulates WAN egress rate.
+- **EC2** — cerebellum: slow integrator, emits pred_err or authoritative HOLD (0x484F).
 
 ---
 
@@ -135,24 +141,29 @@ The cerebellum's HOLD is the shared semantic truth. Local staleness detection at
 ## Architecture
 
 ```
-Pi1 (beacon.c, sid=1)          Pi2 (beacon.c, sid=2)
-  └──── UDP multicast 239.0.0.1:7400 ────┘
+Pi2 (beacon.c sid=1) ─── loopback multicast 239.0.0.1:7400 ─── Pi2 (beacon.c sid=2)
                     ↓
-           Mint reader.c  (axis node)
+           Pi2 reader.c  (axis node — local to Pi2)
            AxisPulse → 239.0.0.2:7404  (~40Hz, locked=1 when Δφ≈π)
                     ↓
+      ┌────────────────────────────────────┐
+      │  Pi2 trineuron substrate           │
+      │  pi2_reader.c (Triangle A)         │
+      │    NucleusState-A → 239.0.0.3:7440 │◄──┐ cross-field W_CROSS=0.05
+      │  pi2_dvfs_reader.c (Triangle B)    │   │
+      │    NucleusState-B → 239.0.0.4:7441 │───┘
+      └────────────────────────────────────┘
+                    ↓ (via Mint nazare.py)
            Mint nazare.py  (transport + staging)
-           CortexPulse → LMDE cortex.py   :7410 UDP  (α=0.02, ~50 events)
-                       → EC2  cerebellum  :7420 TCP  (α=0.005, ~289 events)
+           CortexPulse → EC2 cerebellum  :7420 TCP  (α=0.005, ~289 events)
                     ↑
            DCN pred_err / HOLD ← EC2 cerebellum (reverse SSH tunnel :7421)
-                    ↓ UDP relay
-           Pi2 pi2_reader.c  (tricast pd nucleus + temlum controller)
-           NucleusState → 239.0.0.3:7440  (e_C, temlum, pd_pop, intent)
-           intent → 127.0.0.1:7431
+                    ↓ UDP relay :7430/:7432
+           Pi2 pi2_reader.c / pi2_dvfs_reader.c
+           intent → 127.0.0.1:7431/7433
                     ↓                              ↓
-           Pi2 pi2_actuator.py          Pi1 ns_lan_gain.py
-           (cgroup cpuset, 15s dwell)   (Firestick tc HTB ceil)
+           Pi2 pi2_actuator.py          Pi1 ns_lan_gain.py  ← NucleusState :7440
+           (cgroup cpuset, 15s dwell)   (Firestick tc HTB ceil — pure actuator)
                                                    ↓
                                         Mint ns_wan_gain.py
                                         (WAN egress HTB rate)
@@ -177,14 +188,14 @@ Cerebellum is a pure observer. It sends `pred_err_ema` (raw prediction error) or
 | 7404 | UDP multicast 239.0.0.2 | reader→consumers | AxisPulse (locked timing) |
 | 7405 | UDP | consumers→reader | LoadFeedback |
 | 7408 | UDP loopback | glyph_intent→reader_glyph | Intent pulse (ADVISORY/DIRECTIVE/ALARM) |
-| 7410 | UDP | nazare→LMDE | CortexPulse → cortex.py |
 | 7420 | TCP (SSH tunnel) | nazare→EC2 | CortexPulse → cerebellum |
 | 7421 | TCP (SSH tunnel) | EC2→Mint | DCN pred_err / HOLD |
 | 7430 | UDP | nazare→Pi2 | DCN relay (cpuset neuron) |
 | 7431 | UDP loopback | pi2_reader→pi2_actuator | Intent (PARK/UNPARK/HOLD) — cpuset |
 | 7432 | UDP | nazare→Pi2 | DCN relay (dvfs neuron) |
 | 7433 | UDP loopback | pi2_dvfs_reader→pi2_dvfs_actuator | Intent (PARK/UNPARK/HOLD) — cpufreq |
-| 7440 | UDP multicast 239.0.0.3 | Pi2→LAN | NucleusState (e_C, temlum, pd_pop, intent) |
+| 7440 | UDP multicast 239.0.0.3 | Pi2→LAN | NucleusState-A Triangle A (e_C, temlum, pd_pop, intent) |
+| 7441 | UDP multicast 239.0.0.4 | Pi2→LAN | NucleusState-B Triangle B (e_C, temlum, pd_pop, intent) |
 
 ---
 
@@ -214,11 +225,10 @@ python3 glyph/glyph_intent.py alarm
 
 | File | Runs on | Role |
 |---|---|---|
-| `beacon.c` | Pi1, Pi2 | Kuramoto oscillator, tc drain |
-| `reader.c` | Mint | Axis node, distributes AxisPulse |
+| `beacon.c` | Pi2 (×2) | Kuramoto oscillators sid=1 and sid=2, both on Pi2 |
+| `reader.c` | Pi2 | Axis node, distributes AxisPulse locally |
 | `cpu_reader.c` | Mint | DVFS consumer (cpufreq + MSR voltage) |
 | `tc_shaper.c` | Mint | WAN egress rate modulator |
-| `tm1_reader.c` | LMDE | TM1 clock duty-cycle consumer |
 | `entropy_reader.c` | Mint | Phase → /dev/urandom entropy injection |
 | `phase_sched.c` | Mint | Thundering herd suppressor |
 | `wan_receiver.c` | Mint | WanPulse decoder |
@@ -228,7 +238,6 @@ python3 glyph/glyph_intent.py alarm
 | File | Runs on | Role |
 |---|---|---|
 | `nazare.py` | Mint | Transport + staging layer; relays DCN and HOLD to Pi2 |
-| `cortex.py` | LMDE | Fast EMA integrator (α=0.02) |
 | `pi2/cerebellum_ec2.py` | EC2 | Deep slow integrator (α=0.005); emits HOLD on stale input |
 
 ### Pi2 thermal regulator (`pi2/`)
