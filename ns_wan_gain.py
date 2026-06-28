@@ -31,8 +31,8 @@ import math, signal, socket, struct, subprocess, sys
 IFACE    = sys.argv[1] if len(sys.argv) > 1 else "enp0s31f6"
 TC       = "/usr/sbin/tc"
 CLASSID  = "1:10"
-RATE_MAX = 500     # Mbit nominal WAN ceil
-RATE_MIN = 100     # Mbit floor (G=0)
+RATE_MAX = 900     # Mbit nominal WAN ceil
+RATE_MIN = 450     # Mbit floor (G=0)
 N_STEPS  = 16      # quantisation — limits tc syscall rate
 
 # Gain shaping constants
