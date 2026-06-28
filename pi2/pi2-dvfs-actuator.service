@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi2 cpufreq actuator (Triangle B)
+After=network-online.target pi2-dvfs-reader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/pi/pi2_dvfs_actuator.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

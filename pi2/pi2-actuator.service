@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi2 cpuset actuator (Triangle A)
+After=network-online.target pi2-reader.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/pi/pi2_actuator.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
