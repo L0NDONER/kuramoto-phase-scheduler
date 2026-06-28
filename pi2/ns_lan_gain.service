@@ -1,0 +1,15 @@
+[Unit]
+Description=NucleusState LAN ceiling gain daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/martin/ns_lan_gain.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
