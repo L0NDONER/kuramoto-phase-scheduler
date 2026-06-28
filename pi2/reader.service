@@ -1,0 +1,15 @@
+[Unit]
+Description=Kuramoto axis reader (AxisPulse emitter)
+After=network-online.target beacon-pi.service beacon-pi2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/reader
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
