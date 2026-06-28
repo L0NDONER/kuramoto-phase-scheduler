@@ -38,9 +38,21 @@
 #define P_TARGET    0.0045f
 #define W_P         1.0f
 #define W_T         0.15f
-#define W_PD        0.080f   /* signed phase deviation weight */
 #define E_UNPARK    0.0040f
 #define E_PARK      0.0030f
+
+/* ── tricast pd nucleus ───────────────────────────────────────────────────────
+ * Three EMA channels tracking pd_signed at different timescales.
+ * Individually too weak to override temperature; population sum is sufficient
+ * when all three align (genuine sustained BOOST), not when only fast deflects
+ * (noise spike). This gives hysteresis without raising any single weight.
+ */
+#define ALPHA_FAST  0.35f
+#define ALPHA_MID   0.12f
+#define ALPHA_SLOW  0.03f
+#define W_FAST      0.30f   /* ~3 ticks  / ~75ms  — catches BOOST onset */
+#define W_MID       0.25f   /* ~8 ticks  / ~200ms — carries through DCN window */
+#define W_SLOW      0.18f   /* ~33 ticks / ~825ms — hysteresis tail */
 
 /* ── ports ───────────────────────────────────────────────────────────────── */
 #define AXIS_PORT    7404
@@ -129,7 +141,9 @@ int main(int argc, char **argv) {
 
     float temlum    = 0.0f;
     float pred_err  = P_TARGET;
-    float pd_signed = 0.0f;   /* pd − π: negative = below target (BOOST), positive = above (PARK) */
+    float pd_fast   = 0.0f;   /* tricast nucleus — fast EMA of pd_signed */
+    float pd_mid    = 0.0f;   /* tricast nucleus — medium EMA */
+    float pd_slow   = 0.0f;   /* tricast nucleus — slow EMA */
     uint32_t last_tick = UINT32_MAX;
 
     printf("[pi2_reader] T_target=%.1f P_target=%.4f intent=%s:%d\n",
@@ -160,7 +174,10 @@ int main(int argc, char **argv) {
             last_tick = tick;
 
             float pd = be_float(buf + 16);   /* AxisPulse pd field (offset 16) */
-            pd_signed = pd - (float)M_PI;
+            float pd_s = pd - (float)M_PI;
+            pd_fast = ALPHA_FAST * pd_s + (1.0f - ALPHA_FAST) * pd_fast;
+            pd_mid  = ALPHA_MID  * pd_s + (1.0f - ALPHA_MID)  * pd_mid;
+            pd_slow = ALPHA_SLOW * pd_s + (1.0f - ALPHA_SLOW) * pd_slow;
 
             float T = read_temp();
             float e_T = T - T_TARGET;
@@ -176,16 +193,18 @@ dcn:
             if (magic != DCN_MAGIC) continue;
             pred_err = be_float(buf + 2);
 
-            float e_P = pred_err - P_TARGET;
-            float e_C = W_P * e_P - W_PD * pd_signed - W_T * temlum;
+            float e_P   = pred_err - P_TARGET;
+            float pd_pop = W_FAST * pd_fast + W_MID * pd_mid + W_SLOW * pd_slow;
+            float e_C   = W_P * e_P - pd_pop - W_T * temlum;
 
             const char *intent;
             if      (e_C >  E_UNPARK) intent = "UNPARK";
             else if (e_C < -E_PARK)   intent = "PARK";
             else                       intent = "HOLD";
 
-            printf("[pi2_reader] pred=%.5f temlum=%+.3f pd_s=%+.4f e_C=%+.5f → %s\n",
-                   pred_err, temlum, pd_signed, e_C, intent);
+            printf("[pi2_reader] pred=%.5f temlum=%+.3f "
+                   "pf=%+.4f pm=%+.4f ps=%+.4f pop=%+.5f e_C=%+.5f → %s\n",
+                   pred_err, temlum, pd_fast, pd_mid, pd_slow, pd_pop, e_C, intent);
             fflush(stdout);
 
             sendto(intent_fd, intent, strlen(intent), 0,
