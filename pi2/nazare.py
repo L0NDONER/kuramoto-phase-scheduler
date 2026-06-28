@@ -44,13 +44,14 @@ DRIFT_THRESH_MAX = 0.80
 _cortex_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _cerebellum_sock = None
 _cerebellum_last_attempt = 0.0
+_cerebellum_retry_interval = 1.0
 
 def _get_cerebellum_sock():
-    global _cerebellum_sock, _cerebellum_last_attempt
+    global _cerebellum_sock, _cerebellum_last_attempt, _cerebellum_retry_interval
     if _cerebellum_sock is not None:
         return _cerebellum_sock
     now = time.time()
-    if now - _cerebellum_last_attempt < 1.0:
+    if now - _cerebellum_last_attempt < _cerebellum_retry_interval:
         return None
     _cerebellum_last_attempt = now
     try:
@@ -59,8 +60,10 @@ def _get_cerebellum_sock():
         s.connect((CEREBELLUM_IP, CEREBELLUM_PORT))
         s.settimeout(None)
         _cerebellum_sock = s
+        _cerebellum_retry_interval = 1.0
     except OSError:
         _cerebellum_sock = None
+        _cerebellum_retry_interval = min(_cerebellum_retry_interval * 2, 60.0)
     return _cerebellum_sock
 
 def send_cortex_pulse(x, y, cycle, margin):

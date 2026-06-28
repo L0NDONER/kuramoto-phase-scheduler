@@ -41,6 +41,8 @@
 
 #define ANCHOR_INTERVAL 200   /* re-broadcast t0_ns every N ticks (~10 s) */
 
+#define LP_ALPHA       0.20    /* peer theta low-pass: ~1.0 = no filter, lower = more damping */
+
 #define K_MIN          0.22
 #define K_MAX          0.28
 #define NOISE_AMP      0.008
@@ -129,6 +131,8 @@ int main(int argc, char *argv[]) {
 
     double theta       = 0.0;
     double remote      = -1.0;   /* last remote theta */
+    double peer_lp     = 0.0;   /* low-pass filtered peer theta */
+    int    peer_lp_init = 0;
     double integral    = 0.0;
     double history[LOCK_WINDOW];
     int    hist_n      = 0;
@@ -160,19 +164,25 @@ int main(int argc, char *argv[]) {
             if (rsid == sid) continue;   /* own packet */
             if (rsid != (is_pi2 ? 1 : 2)) continue;
             remote = ntohf(pkt.theta);
+            if (!peer_lp_init) {
+                peer_lp      = remote;
+                peer_lp_init = 1;
+            } else {
+                peer_lp += LP_ALPHA * sin(remote - peer_lp);
+            }
         }
 
         /* Kuramoto coupling */
         double k = K_MIN;
-        if (remote >= 0.0) {
+        if (peer_lp_init) {
             /* phase_diff in [0,pi] */
-            double phase_diff = fabs(fmod(remote - theta + M_PI, 2*M_PI) - M_PI);
+            double phase_diff = fabs(fmod(peer_lp - theta + M_PI, 2*M_PI) - M_PI);
             double serr = phase_diff - PHASE_TARGET;
             k = K_MIN + fabs(serr) * KP + integral * 0.000005;
             if (k < K_MIN) k = K_MIN;
             if (k > K_MAX) k = K_MAX;
 
-            double coupling = sin(remote - theta);
+            double coupling = sin(peer_lp - theta);
             theta += omega - k * coupling + NOISE_AMP * noise();
 
             /* lock detection — rolling window */
@@ -209,7 +219,7 @@ int main(int argc, char *argv[]) {
 
             /* status line */
             if (tick % 200 == 0) {
-                double phase_diff_print = fabs(fmod(remote - theta + M_PI, 2*M_PI) - M_PI);
+                double phase_diff_print = fabs(fmod(peer_lp - theta + M_PI, 2*M_PI) - M_PI);
                 int bar = (int)(phase_diff_print / M_PI * 39);
                 printf("\r[%s] tick=%6u  φ=%.3f  ", argv[1], tick, phase_diff_print);
                 for (int i=0;i<bar;i++) printf("█");
