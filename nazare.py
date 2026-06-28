@@ -39,6 +39,11 @@ _DCN_FMT   = ">Hf"
 _DCN_SIZE  = struct.calcsize(_DCN_FMT)
 _DCN_MAGIC = 0x4443   # "DC"
 DCN_PORT   = 7421
+
+# HOLD wire format: magic(H) — 2 bytes (cerebellum authoritative HOLD)
+_HOLD_FMT   = ">H"
+_HOLD_SIZE  = struct.calcsize(_HOLD_FMT)
+_HOLD_MAGIC = 0x484F  # "HO"
 DRIFT_THRESH_MIN = 0.05
 DRIFT_THRESH_MAX = 0.80
 
@@ -412,10 +417,28 @@ while True:
                 sel.unregister(key.fileobj); key.fileobj.close()
                 _dcn_conn = None
             else:
-                while len(data) >= _DCN_SIZE:
-                    magic, correction = struct.unpack_from(_DCN_FMT, data)
-                    data = data[_DCN_SIZE:]
-                    if magic == _DCN_MAGIC:
+                while len(data) >= 2:
+                    magic = struct.unpack_from(">H", data)[0]
+
+                    if magic == _HOLD_MAGIC:
+                        data = data[_HOLD_SIZE:]
+                        # relay cerebellum HOLD to both pi2 neurons
+                        _hold_pkt = struct.pack(_HOLD_FMT, _HOLD_MAGIC)
+                        try:
+                            _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_PORT))
+                        except OSError:
+                            pass
+                        try:
+                            _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_DVFS_PORT))
+                        except OSError:
+                            pass
+                        print("[dcn] HOLD from cerebellum → relayed to pi2")
+
+                    elif magic == _DCN_MAGIC:
+                        if len(data) < _DCN_SIZE:
+                            break  # partial packet
+                        _, correction = struct.unpack_from(_DCN_FMT, data)
+                        data = data[_DCN_SIZE:]
                         _last_dcn_corr = correction
                         # relay to both Pi2 neurons (LAN UDP, always — shaper gates internally)
                         _dcn_pkt = struct.pack(_DCN_FMT, _DCN_MAGIC, correction)
@@ -432,6 +455,9 @@ while True:
                             thresh = max(DRIFT_THRESH_MIN, min(DRIFT_THRESH_MAX, thresh + correction))
                             consumer_state["_drift_thresh"] = thresh
                             print(f"[dcn] correction={correction:+.4f}  DRIFT_THRESH→{thresh:.3f}")
+
+                    else:
+                        break  # unknown magic, discard remainder
 
         # -------------------------
         # Stage FIFO

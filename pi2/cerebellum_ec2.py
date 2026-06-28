@@ -3,7 +3,12 @@
 Cerebellar EC2 receiver — pure observer.
 CortexPulse in:  magic(H) X(f) Y(f) cycle(I) margin(f)  — 18 bytes  ← forward tunnel :7420
 DCN out:         magic(H) pred_err_ema(f)                —  6 bytes  → reverse tunnel :7421
-Shaper (pi2) owns all control logic via temlum + composite error.
+HOLD out:        magic(H)                                —  2 bytes  → reverse tunnel :7421
+
+HOLD is emitted when:
+  - CortexPulse has been absent >STALE_THRESH seconds (open connection, no data)
+  - First WARMUP_EVENTS events after reconnect (EMA not yet valid)
+Downstream must treat HOLD as "do not commit; hold last good state."
 """
 import socket, struct, time
 
@@ -13,6 +18,8 @@ DCN_PORT       = 7421
 EMA_ALPHA      = 0.005
 UNCERTAIN_BAND = 1.0
 DCN_INTERVAL   = 20
+STALE_THRESH   = 5.0   # seconds without CortexPulse → HOLD
+WARMUP_EVENTS  = DCN_INTERVAL  # events before first correction after reconnect
 
 _CP_FMT   = ">HffIf"
 _CP_SIZE  = struct.calcsize(_CP_FMT)
@@ -21,18 +28,16 @@ _CP_MAGIC = 0x4358
 _DCN_FMT   = ">Hf"
 _DCN_MAGIC = 0x4443
 
+_HOLD_FMT   = ">H"
+_HOLD_MAGIC = 0x484F  # "HO" — cerebellum authoritative HOLD
+
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", LISTEN_PORT))
 srv.listen(1)
 
-print(f"[cerebellum] TCP :{LISTEN_PORT}  α={EMA_ALPHA}  DCN→:{DCN_PORT}", flush=True)
-
-ema_x = ema_y = 0.0
-event = 0
-state = "UNCERTAIN"
-prev_diff = None
-pred_err_ema = 0.0
+print(f"[cerebellum] TCP :{LISTEN_PORT}  α={EMA_ALPHA}  DCN→:{DCN_PORT}"
+      f"  stale_thresh={STALE_THRESH}s", flush=True)
 
 _dcn_conn = None
 _dcn_last_attempt = 0.0
@@ -67,13 +72,38 @@ def send_obs(val):
     except OSError:
         _dcn_conn = None
 
+def send_hold():
+    global _dcn_conn
+    s = _get_dcn_conn()
+    if not s:
+        return
+    try:
+        s.sendall(struct.pack(_HOLD_FMT, _HOLD_MAGIC))
+        print(f"[cerebellum] HOLD →", flush=True)
+    except OSError:
+        _dcn_conn = None
+
 while True:
     conn, addr = srv.accept()
-    print(f"[cerebellum] CortexPulse from {addr}", flush=True)
+    print(f"[cerebellum] CortexPulse from {addr} — resetting EMA", flush=True)
+    send_hold()  # authoritative: EMA is not yet valid on reconnect
+
+    # Reset EMA state — never carry stale values across connection boundaries
+    ema_x = ema_y = 0.0
+    event = 0
+    state = "UNCERTAIN"
+    prev_diff = None
+    pred_err_ema = 0.0
+
+    conn.settimeout(STALE_THRESH)
     buf = b""
     try:
         while True:
-            chunk = conn.recv(4096)
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                send_hold()
+                continue
             if not chunk:
                 break
             buf += chunk
@@ -100,9 +130,13 @@ while True:
                     print(f"[cerebellum] STATE → {state}  (after {event} events)", flush=True)
 
                 if event % DCN_INTERVAL == 0:
-                    send_obs(pred_err_ema)
-                    print(f"[cerebellum] event={event:6d}  diff={diff:+.3f}"
-                          f"  pred_err={pred_err_ema:.5f}  state={state}", flush=True)
+                    if event <= WARMUP_EVENTS:
+                        send_hold()
+                        print(f"[cerebellum] HOLD (warmup)  event={event}", flush=True)
+                    else:
+                        send_obs(pred_err_ema)
+                        print(f"[cerebellum] event={event:6d}  diff={diff:+.3f}"
+                              f"  pred_err={pred_err_ema:.5f}  state={state}", flush=True)
 
     except Exception as e:
         print(f"[cerebellum] connection lost: {e}", flush=True)
