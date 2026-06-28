@@ -40,7 +40,7 @@ G_MIN        = 0.0          # G at full thermal stress (floor from RATE_MIN)
 G_BASE       = 0.30         # minimum gain at carrier trough (30% × RATE range)
 HEADROOM     = 1.5          # °C above T_TARGET for full thermal compression
 EC_SCALE     = 0.05         # e_C range for ±15% bias
-MARGIN_SCALE = 2.0          # nazaré margin for full mod depth
+PD_POP_SCALE = 0.10         # pd_pop magnitude for full mod depth
 
 # EMA alphas for thermal (asymmetric: slow attack, fast release)
 ALPHA_ATTACK  = 0.05
@@ -53,7 +53,6 @@ CP_MAGIC  = 0x4358;  CP_FMT  = "!HffIf"          # CortexPulse 18 bytes
 
 AP_PORT = 7404;  AP_GRP = "239.0.0.2"
 NS_PORT = 7440;  NS_GRP = "239.0.0.3"
-CP_PORT = 7411
 
 
 def tc_run(args):
@@ -84,13 +83,6 @@ def _mcast_sock(port, grp):
     s.setblocking(False)
     return s
 
-def _udp_sock(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("127.0.0.1", port))
-    s.setblocking(False)
-    return s
 
 def drain(sock, size):
     """Read all pending packets, return last valid payload or None."""
@@ -117,16 +109,15 @@ def main():
     ap_sock.setblocking(True)
     ap_sock.settimeout(1.0)    # pace on AxisPulse ticks; 1s timeout = watchdog
     ns_sock = _mcast_sock(NS_PORT, NS_GRP)
-    cp_sock = _udp_sock(CP_PORT)
 
     AP_SIZE = struct.calcsize(AP_FMT)   # 38
     NS_SIZE = struct.calcsize(NS_FMT)   # 16
-    CP_SIZE = struct.calcsize(CP_FMT)   # 18
 
     temlum_ema = 0.0
     e_C_ema    = 0.0
-    margin_ema = 0.5    # start mid-range until nazaré confirms
+    pd_pop_ema = 0.0
     last_step  = -1
+    last_intent = 1
 
     print(f"[ns_wan_gain] {IFACE} {CLASSID}  {RATE_MIN}–{RATE_MAX}Mbit  "
           f"steps={N_STEPS}  G_BASE={G_BASE}", flush=True)
@@ -138,15 +129,9 @@ def main():
             magic, e_C, temlum, pd_pop, intent = struct.unpack(NS_FMT, raw[:NS_SIZE])
             if magic == NS_MAGIC:
                 a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
-                temlum_ema = a * temlum + (1 - a) * temlum_ema
-                e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
-
-        # -- drain CortexPulse (latest wins) --
-        raw = drain(cp_sock, 32)
-        if raw and len(raw) >= CP_SIZE:
-            magic, X, Y, cycle, margin = struct.unpack(CP_FMT, raw[:CP_SIZE])
-            if magic == CP_MAGIC:
-                margin_ema = 0.15 * margin + 0.85 * margin_ema
+                temlum_ema  = a * temlum + (1 - a) * temlum_ema
+                e_C_ema     = 0.10 * e_C + 0.90 * e_C_ema
+                pd_pop_ema  = 0.20 * pd_pop + 0.80 * pd_pop_ema
 
         # -- wait for a locked AxisPulse tick --
         try:
@@ -164,7 +149,7 @@ def main():
 
         # -- compute G_WAN --
         carrier    = (1.0 - math.cos(theta1)) / 2.0
-        mod_depth  = min(1.0, margin_ema / MARGIN_SCALE)
+        mod_depth  = min(1.0, abs(pd_pop_ema) / PD_POP_SCALE)
         t          = max(0.0, min(1.0, temlum_ema / HEADROOM))
         thermal    = 1.0 - t * (1.0 - G_MIN)
         ec_bias    = max(-0.15, min(0.15, e_C_ema / EC_SCALE * 0.15))
@@ -173,14 +158,14 @@ def main():
         G_WAN      = max(0.0, min(1.0, G_WAN))
 
         # -- quantise to N_STEPS, only tc when step changes --
-        step     = round(G_WAN * N_STEPS)
+        step      = round(G_WAN * N_STEPS)
         rate_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * step / N_STEPS)
 
         if step != last_step:
             set_rate(rate_mbit)
             last_step = step
             print(f"[ns_wan_gain] θ={theta1:.3f} carrier={carrier:.3f} "
-                  f"margin={margin_ema:.3f} temlum={temlum_ema:+.3f} "
+                  f"pd_pop={pd_pop_ema:+.4f} temlum={temlum_ema:+.3f} "
                   f"G={G_WAN:.3f} → {rate_mbit}Mbit", flush=True)
 
 
