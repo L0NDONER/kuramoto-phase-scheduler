@@ -64,10 +64,16 @@ def _get_cerebellum_sock():
         _cerebellum_sock = None
     return _cerebellum_sock
 
+WAN_GAIN_PORT = 7411   # loopback — ns_wan_gain.py subscribes here
+
 def send_cortex_pulse(x, y, cycle, margin):
     pkt = struct.pack(_CP_FMT, _CP_MAGIC, x, y, cycle, margin)
     try:
         _cortex_sock.sendto(pkt, (CORTEX_IP, CORTEX_PORT))
+    except OSError:
+        pass
+    try:
+        _cortex_sock.sendto(pkt, ("127.0.0.1", WAN_GAIN_PORT))
     except OSError:
         pass
     global _cerebellum_sock
