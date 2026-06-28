@@ -8,6 +8,7 @@
  *
  * Output:
  *   127.0.0.1:7431  ASCII intent         — "PARK\n" / "UNPARK\n" / "HOLD\n"
+ *   239.0.0.3:7440  NucleusState multicast — e_C, temlum, pd_pop, intent (16 bytes)
  *
  * Control law:
  *   temlum = α·temlum_prev + (1−α)·(T − T_target)
@@ -59,10 +60,23 @@
 #define AXIS_GRP     "239.0.0.2"
 #define DCN_PORT     7430
 #define INTENT_PORT  7431
+#define NS_PORT      7440
+#define NS_GRP       "239.0.0.3"
 
 /* ── wire magic ──────────────────────────────────────────────────────────── */
 #define AP_MAGIC   0x4158   /* "AX" */
 #define DCN_MAGIC  0x4443   /* "DC" */
+#define NS_MAGIC   0x4E53   /* "NS" */
+
+/* ── NucleusState (16 bytes, big-endian) ─────────────────────────────────── */
+typedef struct __attribute__((packed)) {
+    uint16_t magic;    /* 0x4E53 */
+    float    e_C;      /* control law output */
+    float    temlum;   /* T − T_TARGET EMA */
+    float    pd_pop;   /* tricast population sum */
+    uint8_t  intent;   /* 0=PARK 1=HOLD 2=UNPARK */
+    uint8_t  _pad;
+} NucleusState;
 
 /* ── AxisPulse (38 bytes, big-endian) ────────────────────────────────────── */
 typedef struct __attribute__((packed)) {
@@ -139,6 +153,18 @@ int main(int argc, char **argv) {
         .sin_addr.s_addr = inet_addr(intent_ip),
     };
 
+    /* NucleusState multicast emit 239.0.0.3:7440 */
+    int ns_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ns_dst = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(NS_PORT),
+        .sin_addr.s_addr = inet_addr(NS_GRP),
+    };
+    {
+        int ttl = 4;
+        setsockopt(ns_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+    }
+
     float temlum    = 0.0f;
     float pred_err  = P_TARGET;
     float pd_fast   = 0.0f;   /* tricast nucleus — fast EMA of pd_signed */
@@ -198,9 +224,10 @@ dcn:
             float e_C   = W_P * e_P - pd_pop - W_T * temlum;
 
             const char *intent;
-            if      (e_C >  E_UNPARK) intent = "UNPARK";
-            else if (e_C < -E_PARK)   intent = "PARK";
-            else                       intent = "HOLD";
+            uint8_t intent_byte;
+            if      (e_C >  E_UNPARK) { intent = "UNPARK"; intent_byte = 2; }
+            else if (e_C < -E_PARK)   { intent = "PARK";   intent_byte = 0; }
+            else                       { intent = "HOLD";   intent_byte = 1; }
 
             printf("[pi2_reader] pred=%.5f temlum=%+.3f "
                    "pf=%+.4f pm=%+.4f ps=%+.4f pop=%+.5f e_C=%+.5f → %s\n",
@@ -209,6 +236,25 @@ dcn:
 
             sendto(intent_fd, intent, strlen(intent), 0,
                    (struct sockaddr *)&intent_dst, sizeof(intent_dst));
+
+            /* emit NucleusState to 239.0.0.3:7440 */
+            {
+                NucleusState ns;
+                uint32_t tmp;
+                ns.magic  = htons(NS_MAGIC);
+#define F2N(f) (memcpy(&tmp, &(f), 4), htonl(tmp))
+                uint32_t ec_n  = F2N(e_C);
+                uint32_t tl_n  = F2N(temlum);
+                uint32_t pp_n  = F2N(pd_pop);
+#undef F2N
+                memcpy(&ns.e_C,    &ec_n, 4);
+                memcpy(&ns.temlum, &tl_n, 4);
+                memcpy(&ns.pd_pop, &pp_n, 4);
+                ns.intent = intent_byte;
+                ns._pad   = 0;
+                sendto(ns_fd, &ns, sizeof(ns), 0,
+                       (struct sockaddr *)&ns_dst, sizeof(ns_dst));
+            }
         }
     }
 
