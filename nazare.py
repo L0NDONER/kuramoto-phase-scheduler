@@ -118,12 +118,26 @@ def _setup_ns_sock():
     s.setblocking(False)
     return s
 
-ns_sock = _setup_ns_sock()
-sel.register(ns_sock, selectors.EVENT_READ, data="nucleus")
-_withdrawal = False
-
 # DCN replies arrive on the same socket that sends CortexPulse (reply-to-sender NAT traversal)
 sel.register(_cerebellum_sock, selectors.EVENT_READ, data="dcn_udp")
+
+# RefleState subscription — global supervisory state (replaces per-component withdrawal logic)
+_RS_GRP  = "239.0.0.4"; _RS_PORT = 7450
+_RS_MAGIC = 0x5253; _RS_FMT = "!HBff"; _RS_SIZE = struct.calcsize("!HBff")
+_RS_CALM=0; _RS_ALERT=1; _RS_WITHDRAW=2; _RS_PARK=3; _RS_RECOVER=4
+
+def _setup_rs_sock():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", _RS_PORT))
+    mreq = struct.pack("4sl", socket.inet_aton(_RS_GRP), socket.INADDR_ANY)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    s.setblocking(False)
+    return s
+
+_rs_sock = _setup_rs_sock()
+sel.register(_rs_sock, selectors.EVENT_READ, data="reflex")
+_reflex_state = _RS_CALM
 
 # ------------------------------------------------------------
 # 2. FIFOs for staged intents
@@ -227,8 +241,10 @@ def parse_axispulse_packet(data):
                 pd=pd, pd_dev=pd_dev, load_avg=load_avg,
                 drains=drains, t0_ns=t0_ns)
 
-_DRAIN_WIN_NORMAL = 0.25   # rad either side of drain point
-_DRAIN_WIN_CLAMP  = 0.08   # narrowed during withdrawal (phase clamp)
+_DRAIN_WIN_NORMAL  = 0.25   # rad either side of drain point — CALM
+_DRAIN_WIN_ALERT   = 0.18   # narrowed under alert
+_DRAIN_WIN_RECOVER = 0.15   # restricted during recovery
+_DRAIN_WIN_CLAMP   = 0.08   # WITHDRAW / PARK
 _DRAIN_WIN = _DRAIN_WIN_NORMAL
 
 def _a_leads(pkt):
@@ -398,21 +414,24 @@ while True:
                         commit_pending = False
 
         # -------------------------
-        # NucleusState-A — withdrawal reflex
+        # RefleState — supervisory drain-window control
         # -------------------------
-        elif tag == "nucleus":
-            data, _ = ns_sock.recvfrom(32)
-            if len(data) >= _NS_SIZE:
-                fields = struct.unpack_from(_NS_FMT, data)
-                if fields[0] == _NS_MAGIC:
-                    new_w = bool(fields[5])
-                    if new_w and not _withdrawal:
-                        _DRAIN_WIN = _DRAIN_WIN_CLAMP
-                        print("[nazare] WITHDRAWAL → phase clamp", flush=True)
-                    elif not new_w and _withdrawal:
-                        _DRAIN_WIN = _DRAIN_WIN_NORMAL
-                        print("[nazare] withdrawal clear → phase normal", flush=True)
-                    _withdrawal = new_w
+        elif tag == "reflex":
+            data, _ = _rs_sock.recvfrom(16)
+            if len(data) >= _RS_SIZE:
+                fields = struct.unpack_from(_RS_FMT, data)
+                if fields[0] == _RS_MAGIC:
+                    prev = _reflex_state
+                    _reflex_state = fields[1]
+                    win = {_RS_CALM:     _DRAIN_WIN_NORMAL,
+                           _RS_ALERT:    _DRAIN_WIN_ALERT,
+                           _RS_RECOVER:  _DRAIN_WIN_RECOVER,
+                           _RS_WITHDRAW: _DRAIN_WIN_CLAMP,
+                           _RS_PARK:     _DRAIN_WIN_CLAMP}.get(_reflex_state, _DRAIN_WIN_NORMAL)
+                    if win != _DRAIN_WIN:
+                        _DRAIN_WIN = win
+                        _rs_names = ["CALM","ALERT","WITHDRAW","PARK","RECOVER"]
+                        print(f"[nazare] reflex={_rs_names[_reflex_state]}  DRAIN_WIN→{_DRAIN_WIN:.2f}", flush=True)
 
         # -------------------------
         # DCN_CONTROL from EC2

@@ -50,12 +50,13 @@ ALPHA_RELEASE = 0.30
 AP_MAGIC  = 0x4158;  AP_FMT  = "!HBBIfffffHQ"   # AxisPulse 38 bytes
 NS_MAGIC  = 0x4E53;  NS_FMT  = "!HfffBB"         # NucleusState 16 bytes
 
-WITHDRAW_DIP_S   = 0.30   # rate floor duration on withdrawal signal
-WITHDRAW_HYST_S  = 1.50   # half-restored hysteresis after dip
 CP_MAGIC  = 0x4358;  CP_FMT  = "!HffIf"          # CortexPulse 18 bytes
 
 AP_PORT = 7404;  AP_GRP = "239.0.0.2"
 NS_PORT = 7440;  NS_GRP = "239.0.0.3"
+RS_PORT = 7450;  RS_GRP = "239.0.0.4"
+RS_MAGIC = 0x5253;  RS_FMT = "!HBff";  RS_SIZE = struct.calcsize("!HBff")
+_RS_CALM=0; _RS_ALERT=1; _RS_WITHDRAW=2; _RS_PARK=3; _RS_RECOVER=4
 
 
 def tc_run(args):
@@ -112,34 +113,40 @@ def main():
     ap_sock.setblocking(True)
     ap_sock.settimeout(1.0)    # pace on AxisPulse ticks; 1s timeout = watchdog
     ns_sock = _mcast_sock(NS_PORT, NS_GRP)
+    rs_sock = _mcast_sock(RS_PORT, RS_GRP)
 
     AP_SIZE = struct.calcsize(AP_FMT)   # 38
     NS_SIZE = struct.calcsize(NS_FMT)   # 16
 
-    temlum_ema       = 0.0
-    e_C_ema          = 0.0
-    last_step        = -1
-    last_intent      = 1
-    withdraw_until   = 0.0
-    hysteresis_until = 0.0
+    temlum_ema    = 0.0
+    e_C_ema       = 0.0
+    last_step     = -1
+    last_intent   = 1
+    reflex_state  = _RS_CALM
+    rs_last_t     = time.time()
 
     print(f"[ns_wan_gain] {IFACE} {CLASSID}  {RATE_MIN}–{RATE_MAX}Mbit  "
           f"steps={N_STEPS}  G_BASE={G_BASE}", flush=True)
 
     while True:
+        # -- drain RefleState (latest wins; fall back to CALM if stale) --
+        rs_raw = drain(rs_sock, 16)
+        if rs_raw and len(rs_raw) >= RS_SIZE:
+            rf = struct.unpack_from(RS_FMT, rs_raw)
+            if rf[0] == RS_MAGIC:
+                reflex_state = rf[1]
+                rs_last_t    = time.time()
+        elif time.time() - rs_last_t > 5.0:
+            reflex_state = _RS_CALM   # reflex.py not running — don't penalise
+
         # -- drain NucleusState (latest wins) --
         raw = drain(ns_sock, 32)
         if raw and len(raw) >= NS_SIZE:
-            magic, e_C, temlum, pd_pop, intent, withdrawal = struct.unpack(NS_FMT, raw[:NS_SIZE])
+            magic, e_C, temlum, pd_pop, intent, _wd = struct.unpack(NS_FMT, raw[:NS_SIZE])
             if magic == NS_MAGIC:
                 a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
                 temlum_ema = a * temlum + (1 - a) * temlum_ema
                 e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
-                if withdrawal:
-                    now = time.time()
-                    withdraw_until   = now + WITHDRAW_DIP_S
-                    hysteresis_until = now + WITHDRAW_HYST_S
-                    print(f"[ns_wan_gain] WITHDRAWAL → rate dip {WITHDRAW_DIP_S*1000:.0f}ms", flush=True)
 
         # -- wait for a locked AxisPulse tick --
         try:
@@ -163,13 +170,16 @@ def main():
         ec_bias    = max(-0.15, min(0.15, e_C_ema / EC_SCALE * 0.15))
 
         G_WAN      = thermal * (G_BASE + (1.0 - G_BASE) * mod_depth * carrier) + ec_bias
-        G_WAN      = max(0.0, min(1.0, G_WAN))
+        G_WAN = max(0.0, min(1.0, G_WAN))
 
-        now = time.time()
-        if now < withdraw_until:
+        if reflex_state == _RS_PARK:
             G_WAN = 0.0
-        elif now < hysteresis_until:
-            G_WAN *= 0.5
+        elif reflex_state == _RS_WITHDRAW:
+            G_WAN = min(G_WAN, 0.10)
+        elif reflex_state == _RS_ALERT:
+            G_WAN = min(G_WAN, 0.60)
+        elif reflex_state == _RS_RECOVER:
+            G_WAN = min(G_WAN, 0.80)
 
         # -- quantise to N_STEPS, only tc when step changes --
         step      = round(G_WAN * N_STEPS)
