@@ -26,7 +26,7 @@ Manages its own qdisc; tears it down on SIGINT/SIGTERM.
 Run: sudo python3 ns_wan_gain.py [iface]
 """
 
-import math, signal, socket, struct, subprocess, sys
+import math, signal, socket, struct, subprocess, sys, time
 
 IFACE    = sys.argv[1] if len(sys.argv) > 1 else "enp0s31f6"
 TC       = "/usr/sbin/tc"
@@ -48,7 +48,10 @@ ALPHA_RELEASE = 0.30
 
 # Wire formats
 AP_MAGIC  = 0x4158;  AP_FMT  = "!HBBIfffffHQ"   # AxisPulse 38 bytes
-NS_MAGIC  = 0x4E53;  NS_FMT  = "!HfffBx"         # NucleusState 16 bytes
+NS_MAGIC  = 0x4E53;  NS_FMT  = "!HfffBB"         # NucleusState 16 bytes
+
+WITHDRAW_DIP_S   = 0.30   # rate floor duration on withdrawal signal
+WITHDRAW_HYST_S  = 1.50   # half-restored hysteresis after dip
 CP_MAGIC  = 0x4358;  CP_FMT  = "!HffIf"          # CortexPulse 18 bytes
 
 AP_PORT = 7404;  AP_GRP = "239.0.0.2"
@@ -113,10 +116,12 @@ def main():
     AP_SIZE = struct.calcsize(AP_FMT)   # 38
     NS_SIZE = struct.calcsize(NS_FMT)   # 16
 
-    temlum_ema = 0.0
-    e_C_ema    = 0.0
-    last_step  = -1
-    last_intent = 1
+    temlum_ema       = 0.0
+    e_C_ema          = 0.0
+    last_step        = -1
+    last_intent      = 1
+    withdraw_until   = 0.0
+    hysteresis_until = 0.0
 
     print(f"[ns_wan_gain] {IFACE} {CLASSID}  {RATE_MIN}–{RATE_MAX}Mbit  "
           f"steps={N_STEPS}  G_BASE={G_BASE}", flush=True)
@@ -125,11 +130,16 @@ def main():
         # -- drain NucleusState (latest wins) --
         raw = drain(ns_sock, 32)
         if raw and len(raw) >= NS_SIZE:
-            magic, e_C, temlum, pd_pop, intent = struct.unpack(NS_FMT, raw[:NS_SIZE])
+            magic, e_C, temlum, pd_pop, intent, withdrawal = struct.unpack(NS_FMT, raw[:NS_SIZE])
             if magic == NS_MAGIC:
                 a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
                 temlum_ema = a * temlum + (1 - a) * temlum_ema
                 e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
+                if withdrawal:
+                    now = time.time()
+                    withdraw_until   = now + WITHDRAW_DIP_S
+                    hysteresis_until = now + WITHDRAW_HYST_S
+                    print(f"[ns_wan_gain] WITHDRAWAL → rate dip {WITHDRAW_DIP_S*1000:.0f}ms", flush=True)
 
         # -- wait for a locked AxisPulse tick --
         try:
@@ -154,6 +164,12 @@ def main():
 
         G_WAN      = thermal * (G_BASE + (1.0 - G_BASE) * mod_depth * carrier) + ec_bias
         G_WAN      = max(0.0, min(1.0, G_WAN))
+
+        now = time.time()
+        if now < withdraw_until:
+            G_WAN = 0.0
+        elif now < hysteresis_until:
+            G_WAN *= 0.5
 
         # -- quantise to N_STEPS, only tc when step changes --
         step      = round(G_WAN * N_STEPS)

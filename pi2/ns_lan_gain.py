@@ -17,12 +17,15 @@ fast release (restore quickly on cooling).
 
 Run: sudo python3 ns_lan_gain.py
 """
-import socket, struct, subprocess
+import socket, struct, subprocess, time
 
 NS_GRP   = "239.0.0.3"
 NS_PORT  = 7440
 NS_MAGIC = 0x4E53
-NS_FMT   = "!HfffBx"
+NS_FMT   = "!HfffBB"
+
+WITHDRAW_DIP_S  = 0.30
+WITHDRAW_HYST_S = 1.50
 
 TC       = "/usr/sbin/tc"
 TC_DEV   = "eth0"
@@ -54,9 +57,11 @@ def main():
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     sock.settimeout(10.0)
 
-    temlum_ema = 0.0
-    e_C_ema    = 0.0
-    last_ceil  = RATE_MAX
+    temlum_ema       = 0.0
+    e_C_ema          = 0.0
+    last_ceil        = RATE_MAX
+    withdraw_until   = 0.0
+    hysteresis_until = 0.0
 
     print(f"[ns_lan_gain] {TC_DEV} class {TC_CLASS}  "
           f"ceil {RATE_MIN}–{RATE_MAX}Mbit  listening {NS_GRP}:{NS_PORT}", flush=True)
@@ -70,9 +75,15 @@ def main():
 
         if len(data) < 16:
             continue
-        magic, e_C, temlum, pd_pop, intent = struct.unpack(NS_FMT, data[:16])
+        magic, e_C, temlum, pd_pop, intent, withdrawal = struct.unpack(NS_FMT, data[:16])
         if magic != NS_MAGIC:
             continue
+
+        now = time.time()
+        if withdrawal:
+            withdraw_until   = now + WITHDRAW_DIP_S
+            hysteresis_until = now + WITHDRAW_HYST_S
+            print("[ns_lan_gain] WITHDRAWAL → burst suppression", flush=True)
 
         # asymmetric EMA — slow attack, fast release
         alpha_t = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
@@ -87,6 +98,10 @@ def main():
         ec_bias = max(-0.10, min(0.10, e_C_ema / EC_SCALE * 0.10))
 
         G_LAN = max(G_MIN, min(1.0, thermal + ec_bias))
+        if now < withdraw_until:
+            G_LAN = G_MIN
+        elif now < hysteresis_until:
+            G_LAN = G_MIN + (G_LAN - G_MIN) * 0.5
         ceil_mbit = round(RATE_MIN + (RATE_MAX - RATE_MIN) * G_LAN)
 
         print(f"[ns_lan_gain] temlum={temlum_ema:+.3f} e_C={e_C_ema:+.5f} "

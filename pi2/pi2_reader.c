@@ -73,8 +73,12 @@
 #define HOLD_MAGIC 0x484F   /* "HO" — cerebellum authoritative HOLD */
 #define NS_MAGIC   0x4E53   /* "NS" */
 
-/* ── staleness ───────────────────────────────────────────────────────────── */
-#define DCN_STALE_SECS 5
+/* ── staleness / withdrawal ──────────────────────────────────────────────── */
+#define DCN_STALE_SECS      5
+#define DCN_WITHDRAW_SECS   30     /* several EMA windows before reflex fires */
+#define PRED_FLAT_THRESH    0.000002f  /* pred_var_ema below this = flat signal */
+#define PRED_MIN_COUNT      20     /* need at least this many DCN packets first */
+#define W_WITHDRAW          0.20f  /* extra PARK bias during withdrawal */
 
 /* ── NucleusState (16 bytes, big-endian) ─────────────────────────────────── */
 typedef struct __attribute__((packed)) {
@@ -82,8 +86,8 @@ typedef struct __attribute__((packed)) {
     float    e_C;
     float    temlum;
     float    pd_pop;
-    uint8_t  intent;   /* 0=PARK 1=HOLD 2=UNPARK */
-    uint8_t  _pad;
+    uint8_t  intent;      /* 0=PARK 1=HOLD 2=UNPARK */
+    uint8_t  withdrawal;  /* 1 = reflex active */
 } NucleusState;
 
 /* ── AxisPulse (38 bytes, big-endian) ────────────────────────────────────── */
@@ -121,7 +125,8 @@ static float read_temp(void) {
 static void emit_intent(int fd, struct sockaddr_in *dst,
                         int ns_fd, struct sockaddr_in *ns_dst,
                         float e_C, float temlum, float pd_pop,
-                        const char *intent, uint8_t intent_byte) {
+                        const char *intent, uint8_t intent_byte,
+                        uint8_t withdrawal) {
     sendto(fd, intent, strlen(intent), 0, (struct sockaddr *)dst, sizeof(*dst));
 
     NucleusState ns;
@@ -135,8 +140,8 @@ static void emit_intent(int fd, struct sockaddr_in *dst,
     memcpy(&ns.e_C,    &ec_n, 4);
     memcpy(&ns.temlum, &tl_n, 4);
     memcpy(&ns.pd_pop, &pp_n, 4);
-    ns.intent = intent_byte;
-    ns._pad   = 0;
+    ns.intent     = intent_byte;
+    ns.withdrawal = withdrawal;
     sendto(ns_fd, &ns, sizeof(ns), 0, (struct sockaddr *)ns_dst, sizeof(*ns_dst));
 }
 
@@ -205,6 +210,11 @@ int main(int argc, char **argv) {
     float pd_slow  = 0.0f;
     uint32_t last_tick = UINT32_MAX;
 
+    /* withdrawal detection */
+    float    pred_err_ema = P_TARGET;
+    float    pred_var_ema = 0.0f;
+    uint32_t dcn_count    = 0;
+
     struct timespec last_dcn_time;
     clock_gettime(CLOCK_MONOTONIC, &last_dcn_time);
 
@@ -246,16 +256,28 @@ int main(int argc, char **argv) {
                     float T = read_temp();
                     temlum = ALPHA_T * temlum + (1.0f - ALPHA_T) * (T - T_TARGET);
 
-                    /* local HOLD fallback — DCN gone stale */
+                    /* DCN staleness → HOLD or WITHDRAWAL */
                     struct timespec now;
                     clock_gettime(CLOCK_MONOTONIC, &now);
                     double age = (double)(now.tv_sec  - last_dcn_time.tv_sec)
                                + (double)(now.tv_nsec - last_dcn_time.tv_nsec) * 1e-9;
                     if (age > DCN_STALE_SECS) {
                         float pd_pop = W_FAST*pd_fast + W_MID*pd_mid + W_SLOW*pd_slow;
-                        emit_intent(intent_fd, &intent_dst, ns_a_fd, &ns_a_dst,
-                                    0.0f, temlum, pd_pop, "HOLD", 1);
-                        printf("[pi2_reader/A] HOLD (local stale %.0fs)\n", age);
+                        int withdraw = (age > DCN_WITHDRAW_SECS)
+                                    && (dcn_count >= PRED_MIN_COUNT)
+                                    && (pred_var_ema < PRED_FLAT_THRESH);
+                        if (withdraw) {
+                            /* local contraction: thermal-only e_C with extra PARK bias */
+                            float e_C_w = -W_T * temlum - pd_pop - W_WITHDRAW;
+                            emit_intent(intent_fd, &intent_dst, ns_a_fd, &ns_a_dst,
+                                        e_C_w, temlum, pd_pop, "PARK", 0, 1);
+                            printf("[pi2_reader/A] WITHDRAWAL stale=%.0fs var=%.7f → PARK\n",
+                                   age, pred_var_ema);
+                        } else {
+                            emit_intent(intent_fd, &intent_dst, ns_a_fd, &ns_a_dst,
+                                        0.0f, temlum, pd_pop, "HOLD", 1, 0);
+                            printf("[pi2_reader/A] HOLD (stale %.0fs)\n", age);
+                        }
                         fflush(stdout);
                     }
                 }
@@ -281,7 +303,7 @@ int main(int argc, char **argv) {
             if (magic == HOLD_MAGIC) {
                 float pd_pop = W_FAST*pd_fast + W_MID*pd_mid + W_SLOW*pd_slow;
                 emit_intent(intent_fd, &intent_dst, ns_a_fd, &ns_a_dst,
-                            0.0f, temlum, pd_pop, "HOLD", 1);
+                            0.0f, temlum, pd_pop, "HOLD", 1, 0);
                 printf("[pi2_reader/A] HOLD (cerebellum)\n");
                 fflush(stdout);
                 clock_gettime(CLOCK_MONOTONIC, &last_dcn_time);
@@ -291,6 +313,12 @@ int main(int argc, char **argv) {
             if (magic != DCN_MAGIC || n < 6) continue;
             pred_err = be_float(buf + 2);
             clock_gettime(CLOCK_MONOTONIC, &last_dcn_time);
+
+            /* track pred_err variance for withdrawal detection */
+            pred_err_ema = 0.1f * pred_err + 0.9f * pred_err_ema;
+            float dev = pred_err - pred_err_ema;
+            pred_var_ema = 0.1f * dev*dev + 0.9f * pred_var_ema;
+            dcn_count++;
 
             float e_P    = pred_err - P_TARGET;
             float pd_pop = W_FAST*pd_fast + W_MID*pd_mid + W_SLOW*pd_slow;
@@ -309,7 +337,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
 
             emit_intent(intent_fd, &intent_dst, ns_a_fd, &ns_a_dst,
-                        e_C, temlum, pd_pop, intent, intent_byte);
+                        e_C, temlum, pd_pop, intent, intent_byte, 0);
         }
     }
 

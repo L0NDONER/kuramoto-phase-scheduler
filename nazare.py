@@ -21,8 +21,8 @@ MCAST_PORT = 7404
 CORTEX_IP   = "10.0.0.175"
 CORTEX_PORT = 7410
 
-# Cerebellar output — EC2 deep integrator (SSH tunnel → localhost:7420)
-CEREBELLUM_IP   = "127.0.0.1"
+# Cerebellar output — EC2 deep integrator (UDP → flaz.duckdns.org:7420; reply-to-sender for DCN)
+CEREBELLUM_HOST = "flaz.duckdns.org"
 CEREBELLUM_PORT = 7420
 
 # Pi2 shaper — DCN nudge relay (LAN UDP)
@@ -48,26 +48,13 @@ DRIFT_THRESH_MIN = 0.05
 DRIFT_THRESH_MAX = 0.80
 
 _cortex_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-_cerebellum_sock = None
-_cerebellum_last_attempt = 0.0
 
-def _get_cerebellum_sock():
-    global _cerebellum_sock, _cerebellum_last_attempt
-    if _cerebellum_sock is not None:
-        return _cerebellum_sock
-    now = time.time()
-    if now - _cerebellum_last_attempt < 1.0:
-        return None
-    _cerebellum_last_attempt = now
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect((CEREBELLUM_IP, CEREBELLUM_PORT))
-        s.settimeout(None)
-        _cerebellum_sock = s
-    except OSError:
-        _cerebellum_sock = None
-    return _cerebellum_sock
+# Dedicated socket for EC2 cerebellum — sends CortexPulse, receives DCN replies
+import socket as _socket
+_cerebellum_ip   = _socket.gethostbyname(CEREBELLUM_HOST)
+_cerebellum_addr = (_cerebellum_ip, CEREBELLUM_PORT)
+_cerebellum_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_cerebellum_sock.setblocking(False)
 
 WAN_GAIN_PORT = 7411   # loopback — ns_wan_gain.py subscribes here
 
@@ -81,13 +68,10 @@ def send_cortex_pulse(x, y, cycle, margin):
         _cortex_sock.sendto(pkt, ("127.0.0.1", WAN_GAIN_PORT))
     except OSError:
         pass
-    global _cerebellum_sock
-    s = _get_cerebellum_sock()
-    if s:
-        try:
-            s.sendall(pkt)
-        except OSError:
-            _cerebellum_sock = None
+    try:
+        _cerebellum_sock.sendto(pkt, _cerebellum_addr)
+    except OSError:
+        pass
 
 # FIFOs for stage/commit
 FIFO_STAGE = "/tmp/nazare_stage"
@@ -118,14 +102,28 @@ def setup_axispulse_socket():
 axispulse_sock = setup_axispulse_socket()
 sel.register(axispulse_sock, selectors.EVENT_READ, data="axispulse")
 
-# DCN_CONTROL listener — EC2 cerebellar correction via reverse SSH tunnel (:7421 TCP)
-dcn_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-dcn_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-dcn_srv.bind(("127.0.0.1", DCN_PORT))
-dcn_srv.listen(1)
-dcn_srv.setblocking(False)
-sel.register(dcn_srv, selectors.EVENT_READ, data="dcn_srv")
-_dcn_conn = None   # accepted DCN socket
+# NucleusState-A subscription — withdrawal reflex signal
+_NS_FMT   = "!HfffBB"
+_NS_SIZE  = struct.calcsize(_NS_FMT)
+_NS_MAGIC = 0x4E53
+_NS_GRP   = "239.0.0.3"
+_NS_PORT  = 7440
+
+def _setup_ns_sock():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", _NS_PORT))
+    mreq = struct.pack("4sl", socket.inet_aton(_NS_GRP), socket.INADDR_ANY)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    s.setblocking(False)
+    return s
+
+ns_sock = _setup_ns_sock()
+sel.register(ns_sock, selectors.EVENT_READ, data="nucleus")
+_withdrawal = False
+
+# DCN replies arrive on the same socket that sends CortexPulse (reply-to-sender NAT traversal)
+sel.register(_cerebellum_sock, selectors.EVENT_READ, data="dcn_udp")
 
 # ------------------------------------------------------------
 # 2. FIFOs for staged intents
@@ -229,7 +227,9 @@ def parse_axispulse_packet(data):
                 pd=pd, pd_dev=pd_dev, load_avg=load_avg,
                 drains=drains, t0_ns=t0_ns)
 
-_DRAIN_WIN = 0.25   # rad either side of drain point
+_DRAIN_WIN_NORMAL = 0.25   # rad either side of drain point
+_DRAIN_WIN_CLAMP  = 0.08   # narrowed during withdrawal (phase clamp)
+_DRAIN_WIN = _DRAIN_WIN_NORMAL
 
 def _a_leads(pkt):
     """True when A is ahead of anti-phase: signed pd > π."""
@@ -395,69 +395,59 @@ while True:
                         commit_pending = False
 
         # -------------------------
+        # NucleusState-A — withdrawal reflex
+        # -------------------------
+        elif tag == "nucleus":
+            data, _ = ns_sock.recvfrom(32)
+            if len(data) >= _NS_SIZE:
+                fields = struct.unpack_from(_NS_FMT, data)
+                if fields[0] == _NS_MAGIC:
+                    new_w = bool(fields[5])
+                    if new_w and not _withdrawal:
+                        _DRAIN_WIN = _DRAIN_WIN_CLAMP
+                        print("[nazare] WITHDRAWAL → phase clamp", flush=True)
+                    elif not new_w and _withdrawal:
+                        _DRAIN_WIN = _DRAIN_WIN_NORMAL
+                        print("[nazare] withdrawal clear → phase normal", flush=True)
+                    _withdrawal = new_w
+
+        # -------------------------
         # DCN_CONTROL from EC2
         # -------------------------
-        elif tag == "dcn_srv":
-            # new connection from EC2 via reverse tunnel
-            conn, _ = dcn_srv.accept()
-            conn.setblocking(False)
-            if _dcn_conn:
-                try: sel.unregister(_dcn_conn); _dcn_conn.close()
-                except OSError: pass
-            _dcn_conn = conn
-            sel.register(_dcn_conn, selectors.EVENT_READ, data="dcn_data")
-            print("[dcn] EC2 cerebellar connection established")
-
-        elif tag == "dcn_data":
-            try:
-                data = key.fileobj.recv(64)
-            except OSError:
-                data = b""
-            if not data:
-                sel.unregister(key.fileobj); key.fileobj.close()
-                _dcn_conn = None
+        elif tag == "dcn_udp":
+            data, _ = _cerebellum_sock.recvfrom(64)
+            if len(data) < 2:
+                pass
             else:
-                while len(data) >= 2:
-                    magic = struct.unpack_from(">H", data)[0]
-
-                    if magic == _HOLD_MAGIC:
-                        data = data[_HOLD_SIZE:]
-                        # relay cerebellum HOLD to both pi2 neurons
-                        _hold_pkt = struct.pack(_HOLD_FMT, _HOLD_MAGIC)
-                        try:
-                            _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_PORT))
-                        except OSError:
-                            pass
-                        try:
-                            _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_DVFS_PORT))
-                        except OSError:
-                            pass
-                        print("[dcn] HOLD from cerebellum → relayed to pi2")
-
-                    elif magic == _DCN_MAGIC:
-                        if len(data) < _DCN_SIZE:
-                            break  # partial packet
-                        _, correction = struct.unpack_from(_DCN_FMT, data)
-                        data = data[_DCN_SIZE:]
-                        _last_dcn_corr = correction
-                        # relay to both Pi2 neurons (LAN UDP, always — shaper gates internally)
-                        _dcn_pkt = struct.pack(_DCN_FMT, _DCN_MAGIC, correction)
-                        try:
-                            _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_PORT))
-                        except OSError:
-                            pass
-                        try:
-                            _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_DVFS_PORT))
-                        except OSError:
-                            pass
-                        if DCN_ENABLED:
-                            thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
-                            thresh = max(DRIFT_THRESH_MIN, min(DRIFT_THRESH_MAX, thresh + correction))
-                            consumer_state["_drift_thresh"] = thresh
-                            print(f"[dcn] correction={correction:+.4f}  DRIFT_THRESH→{thresh:.3f}")
-
-                    else:
-                        break  # unknown magic, discard remainder
+                magic = struct.unpack_from(">H", data)[0]
+                if magic == _HOLD_MAGIC:
+                    _hold_pkt = struct.pack(_HOLD_FMT, _HOLD_MAGIC)
+                    try:
+                        _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_PORT))
+                    except OSError:
+                        pass
+                    try:
+                        _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_DVFS_PORT))
+                    except OSError:
+                        pass
+                    print("[dcn] HOLD from cerebellum → relayed to pi2")
+                elif magic == _DCN_MAGIC and len(data) >= _DCN_SIZE:
+                    _, correction = struct.unpack_from(_DCN_FMT, data)
+                    _last_dcn_corr = correction
+                    _dcn_pkt = struct.pack(_DCN_FMT, _DCN_MAGIC, correction)
+                    try:
+                        _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_PORT))
+                    except OSError as _e:
+                        print(f"[dcn] relay PI2 error: {_e}", flush=True)
+                    try:
+                        _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_DVFS_PORT))
+                    except OSError as _e:
+                        print(f"[dcn] relay DVFS error: {_e}", flush=True)
+                    if DCN_ENABLED:
+                        thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
+                        thresh = max(DRIFT_THRESH_MIN, min(DRIFT_THRESH_MAX, thresh + correction))
+                        consumer_state["_drift_thresh"] = thresh
+                        print(f"[dcn] correction={correction:+.4f}  DRIFT_THRESH→{thresh:.3f}")
 
         # -------------------------
         # Stage FIFO
