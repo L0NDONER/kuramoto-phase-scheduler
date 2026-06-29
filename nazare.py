@@ -384,8 +384,11 @@ while True:
                 last_alignment = pkt
                 if pkt["locked"]:
                     _apply_autonomous_decay(pkt)
-                    pw = consumer_state["pathway"]
-                    send_cortex_pulse(float(pw.get("X", 0)), float(pw.get("Y", 0)), cycle, 0.0)
+                    thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
+                    pd_dev = pkt["pd_dev"]
+                    x_sig = max(0.0, 1.0 - pd_dev / thresh)
+                    y_sig = min(1.0, pd_dev / thresh)
+                    send_cortex_pulse(x_sig, y_sig, cycle, abs(x_sig - y_sig))
                     lmde_temp = _read_lmde_temp()
                     _log_tick(cycle, pkt["pd_dev"], _last_dcn_corr, lmde_temp)
                     _check_episode(cycle)
