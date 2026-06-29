@@ -37,9 +37,9 @@ N_STEPS  = 16      # quantisation — limits tc syscall rate
 
 # Gain shaping constants
 G_MIN        = 0.0          # G at full thermal stress (floor from RATE_MIN)
-G_BASE       = 0.30         # minimum gain at carrier trough (30% × RATE range)
+G_BASE       = 0.55         # minimum gain at carrier trough (55% × RATE range)
 HEADROOM     = 1.5          # °C above T_TARGET for full thermal compression
-EC_SCALE     = 0.05         # e_C range for ±15% bias
+EC_SCALE     = 0.20         # e_C range for ±15% bias
 EC_MOD_SCALE = 0.02         # e_C for full mod depth (E_UNPARK=0.004, headroom ~5×)
 
 # EMA alphas for thermal (asymmetric: slow attack, fast release)
