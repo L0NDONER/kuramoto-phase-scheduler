@@ -133,6 +133,11 @@ def run_challenge():
     return False
 
 
+def gate_check() -> bool:
+    """Importable gate: returns True if a LAN prover responds correctly."""
+    return run_challenge()
+
+
 if __name__ == "__main__":
     loop = "--loop" in sys.argv
     if loop:
