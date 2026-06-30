@@ -2,61 +2,78 @@
 """
 presence_probe.py — Physical signature prober.
 
-Standalone — no carrier, no beacon, no AxisPulse dependency.
-Probes a target every PROBE_INTERVAL seconds. Measures:
-  dns_ms   — DNS resolution time
-  tcp_ms   — TCP connect time
-  tls_ms   — TLS handshake duration
-  ttfb_ms  — time to first byte
-  entropy  — Shannon entropy of first 2KB of response body
-  cert_fp  — SHA256[:16] of leaf certificate DER
+Standalone — no carrier, no beacon. Probes every PROBE_INTERVAL seconds.
+Measures: dns_ms, tcp_ms, tls_ms, ttfb_ms, entropy, cert_fp.
 
-Validates resolved IP against known ASN ranges per hostname.
-Builds EMA canonical profile after WARMUP probes; flags deviations.
-Emits ProbeResult on 239.0.0.6:7460 for presence_verifier.py.
+ASN validation via Team Cymru DNS TXT (no API key needed).
+Cross-node comparison via ProbeResult multicast 239.0.0.6:7460.
+EC2 anchor (node=3) sends unicast to Mint WireGuard IP instead.
 
-Usage: python3 presence_probe.py [host] [port] [node_id]
-       node_id: 1=Pi1  2=Pi2  0=Mint  (default 1)
-       Default: amazon.co.uk 443 1
+Usage: python3 presence_probe.py [host] [port] [node_id] [dest_ip]
+  node_id: 1=Pi1  2=Pi2  0=Mint  3=EC2   (default 1)
+  dest_ip: unicast destination instead of multicast (EC2 use only)
 """
-import collections, hashlib, math, socket, ssl, struct, sys, time
+import collections, hashlib, math, socket, ssl, struct, subprocess, sys, time
 
-# ProbeResult multicast — magic(H) node(B) epoch(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s) ip(4s)
 PR_GRP   = "239.0.0.6"; PR_PORT = 7460
 PR_FMT   = "!HBIHHHHH8s4s"
-PR_MAGIC = 0x5050   # "PP"
+PR_MAGIC = 0x5050
 
-# Known ASN ranges per hostname — (network_int, mask_int)
-def _cidr(net, bits):
-    n = struct.unpack("!I", socket.inet_aton(net))[0]
-    m = (0xFFFFFFFF << (32 - int(bits))) & 0xFFFFFFFF
-    return (n & m, m)
-
-_AWS = [_cidr("3.0.0.0", 8), _cidr("13.0.0.0", 8), _cidr("18.0.0.0", 8),
-        _cidr("52.0.0.0", 8), _cidr("54.0.0.0", 8), _cidr("99.77.0.0", 16),
-        _cidr("130.176.0.0", 16), _cidr("143.204.0.0", 16), _cidr("205.251.192.0", 19)]
-
-KNOWN_RANGES = {
-    "amazon.co.uk": _AWS,
-    "amazon.com":   _AWS,
-    "amazon.de":    _AWS,
-    "amazon.fr":    _AWS,
+# Known ASNs per hostname — resolved IP must belong to one of these
+KNOWN_ASNS = {
+    "amazon.co.uk":  {16509},
+    "amazon.com":    {16509},
+    "amazon.de":     {16509},
+    "amazon.fr":     {16509},
+    "bbc.co.uk":     {2818, 20940},   # BBC + Akamai
+    "bbc.com":       {2818, 20940},
+    "paypal.com":    {17012},
+    "paypal.co.uk":  {17012},
+    "google.com":    {15169},
+    "youtube.com":   {15169},
+    "facebook.com":  {32934},
+    "apple.com":     {714},
+    "twitter.com":   {13414},
 }
 
-def _ip_ok(ip_str, host):
-    ranges = KNOWN_RANGES.get(host)
-    if not ranges:
-        return True
-    ip_int = struct.unpack("!I", socket.inet_aton(ip_str))[0]
-    return any((ip_int & m) == n for n, m in ranges)
 
-HOST            = sys.argv[1] if len(sys.argv) > 1 else "amazon.co.uk"
-PORT            = int(sys.argv[2]) if len(sys.argv) > 2 else 443
-NODE_ID         = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-PROBE_INTERVAL  = 75      # seconds between probes
-WARMUP          = 5
-EMA_A           = 0.25
-ALERT_SD        = 2.5
+def _lookup_asn(ip):
+    """Team Cymru DNS TXT ASN lookup. Returns int or None if unavailable."""
+    rev = ".".join(reversed(ip.split(".")))
+    try:
+        out = subprocess.check_output(
+            ["dig", "+short", "TXT", f"{rev}.origin.asn.cymru.com", "@1.1.1.1"],
+            timeout=5, stderr=subprocess.DEVNULL
+        ).decode()
+        for line in out.strip().splitlines():
+            line = line.strip('" ')
+            if "|" in line:
+                return int(line.split("|")[0].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _asn_ok(ip, host, asn):
+    expected = KNOWN_ASNS.get(host)
+    if not expected:
+        return True, None
+    if asn is None:
+        return True, None   # ASN lookup failed — skip, don't block
+    if asn not in expected:
+        return False, asn
+    return True, asn
+
+
+HOST           = sys.argv[1] if len(sys.argv) > 1 else "amazon.co.uk"
+PORT           = int(sys.argv[2]) if len(sys.argv) > 2 else 443
+NODE_ID        = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+DEST_IP        = sys.argv[4] if len(sys.argv) > 4 else None   # unicast for EC2
+STDOUT_MODE    = "--stdout" in sys.argv                        # pipe result as JSON, no UDP
+PROBE_INTERVAL = 75
+WARMUP         = 5
+EMA_A          = 0.25
+ALERT_SD       = 2.5
 
 
 def entropy(data):
@@ -71,13 +88,15 @@ def probe(host, port):
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["http/1.1"])
 
-    t0    = time.perf_counter()
-    addrs = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    t0     = time.perf_counter()
+    addrs  = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
     dns_ms = (time.perf_counter() - t0) * 1000
     ip     = addrs[0][4][0]
 
-    if not _ip_ok(ip, host):
-        raise ValueError(f"DNS_POISON  {host} → {ip} not in known ranges")
+    asn = _lookup_asn(ip)
+    ok, bad_asn = _asn_ok(ip, host, asn)
+    if not ok:
+        raise ValueError(f"ASN_MISMATCH  {host} → {ip}  ASN={bad_asn}  expected={KNOWN_ASNS[host]}")
 
     raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     raw.settimeout(10)
@@ -107,10 +126,9 @@ def probe(host, port):
 
     return dict(dns_ms=dns_ms, tcp_ms=tcp_ms, tls_ms=tls_ms,
                 ttfb_ms=ttfb_ms or 0.0, entropy=entropy(body[:2048]),
-                cert_fp=cert_fp, ip=ip)
+                cert_fp=cert_fp, ip=ip, asn=asn)
 
 
-# EMA canonical
 _ema = {}; _ema_sq = {}; _cert_canonical = None
 METRICS = ["dns_ms", "tcp_ms", "tls_ms", "ttfb_ms", "entropy"]
 
@@ -125,21 +143,23 @@ def _sd(k):
     return math.sqrt(max(0.0, _ema_sq[k] - _ema[k] ** 2))
 
 
-pr_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-pr_out.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+if not STDOUT_MODE:
+    pr_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if not DEST_IP:
+        pr_out.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+transport = "stdout/ssh" if STDOUT_MODE else (f"unicast→{DEST_IP}" if DEST_IP else f"mcast→{PR_GRP}")
+print(f"[presence] node={NODE_ID}  {HOST}:{PORT}  every {PROBE_INTERVAL}s  {transport}", flush=True)
 
-print(f"[presence] node={NODE_ID}  {HOST}:{PORT}  every {PROBE_INTERVAL}s", flush=True)
-
-epoch       = 0
 probe_count = 0
 
 while True:
+    epoch = int(time.time()) // PROBE_INTERVAL   # shared wall-clock epoch — same on all nodes
     try:
         r = probe(HOST, PORT)
     except Exception as e:
         print(f"[presence] FAIL  {e}", flush=True)
-        time.sleep(PROBE_INTERVAL)
-        epoch += 1
+        next_epoch_t = (int(time.time()) // PROBE_INTERVAL + 1) * PROBE_INTERVAL
+        time.sleep(max(1, next_epoch_t - time.time()))
         continue
 
     probe_count += 1
@@ -161,23 +181,35 @@ while True:
             _cert_canonical = r["cert_fp"]
 
     tag = "BUILDING" if probe_count <= WARMUP else ("ALERT  " if flags else "MATCH  ")
+    asn_str = str(r["asn"]) if r["asn"] else "?"
     print(f"[presence] epoch={epoch}  #{probe_count:3d}  {tag}", flush=True)
-    print(f"           ip={r['ip']}  dns={r['dns_ms']:.0f}ms  tcp={r['tcp_ms']:.0f}ms"
-          f"  tls={r['tls_ms']:.0f}ms  ttfb={r['ttfb_ms']:.0f}ms"
-          f"  ent={r['entropy']:.3f}  cert={r['cert_fp']}", flush=True)
+    print(f"           ip={r['ip']}  ASN={asn_str}  dns={r['dns_ms']:.0f}ms"
+          f"  tcp={r['tcp_ms']:.0f}ms  tls={r['tls_ms']:.0f}ms"
+          f"  ttfb={r['ttfb_ms']:.0f}ms  ent={r['entropy']:.3f}"
+          f"  cert={r['cert_fp']}", flush=True)
     for fl in flags:
         print(f"           !! {fl}", flush=True)
 
-    try:
-        pkt = struct.pack(PR_FMT, PR_MAGIC, NODE_ID, epoch,
-                          int(r["dns_ms"]), int(r["tcp_ms"]),
-                          int(r["tls_ms"]), int(r["ttfb_ms"]),
-                          int(r["entropy"] * 100),
-                          r["cert_fp"][:8].encode(),
-                          socket.inet_aton(r["ip"]))
-        pr_out.sendto(pkt, (PR_GRP, PR_PORT))
-    except OSError:
-        pass
+    if STDOUT_MODE:
+        import json
+        print("PROBE:" + json.dumps(dict(
+            node=NODE_ID, epoch=epoch,
+            dns_ms=int(r["dns_ms"]), tcp_ms=int(r["tcp_ms"]),
+            tls_ms=int(r["tls_ms"]), ttfb_ms=int(r["ttfb_ms"]),
+            ent_x100=int(r["entropy"] * 100),
+            cert_fp=r["cert_fp"][:8], ip=r["ip"]
+        )), flush=True)
+    else:
+        try:
+            pkt = struct.pack(PR_FMT, PR_MAGIC, NODE_ID, epoch,
+                              int(r["dns_ms"]), int(r["tcp_ms"]),
+                              int(r["tls_ms"]), int(r["ttfb_ms"]),
+                              int(r["entropy"] * 100),
+                              r["cert_fp"][:8].encode(),
+                              socket.inet_aton(r["ip"]))
+            dest = (DEST_IP, PR_PORT) if DEST_IP else (PR_GRP, PR_PORT)
+            pr_out.sendto(pkt, dest)
+        except OSError:
+            pass
 
-    epoch += 1
     time.sleep(PROBE_INTERVAL)
