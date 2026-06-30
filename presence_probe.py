@@ -103,9 +103,9 @@ def probe(host: str, port: int) -> dict:
 
 
 # EMA canonical state
-_ema:    dict[str, float] = {}
-_ema_sq: dict[str, float] = {}
-_cert_canonical: str | None = None
+_ema    = {}
+_ema_sq = {}
+_cert_canonical = None
 
 METRICS = ["dns_ms", "tcp_ms", "tls_ms", "ttfb_ms", "entropy"]
 
@@ -140,8 +140,8 @@ pr_out.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
 print(f"[presence] node={NODE_ID}  target={HOST}:{PORT}  interval={PROBE_EVERY} ticks", flush=True)
 
-probe_count  = 0
-last_probe_t = 0
+probe_count = 0
+last_epoch  = -1   # epoch = tick // PROBE_EVERY; all nodes fire at same epoch boundary
 
 while True:
     data, _ = ap_sock.recvfrom(64)
@@ -150,11 +150,12 @@ while True:
     f = struct.unpack_from(AP_FMT, data)
     if f[0] != AP_MAGIC or not f[2]:
         continue
-    tick = f[3]
+    tick  = f[3]
+    epoch = tick // PROBE_EVERY
 
-    if tick - last_probe_t < PROBE_EVERY:
+    if epoch <= last_epoch:
         continue
-    last_probe_t = tick
+    last_epoch = epoch
 
     try:
         r = probe(HOST, PORT)
@@ -183,7 +184,7 @@ while True:
 
     tag = "BUILDING" if probe_count <= WARMUP else ("ALERT  " if flags else "MATCH  ")
 
-    print(f"[presence] tick={tick}  #{probe_count:3d}  {tag}", flush=True)
+    print(f"[presence] tick={tick}  epoch={epoch}  #{probe_count:3d}  {tag}", flush=True)
     print(f"           dns={r['dns_ms']:6.1f}ms  tcp={r['tcp_ms']:6.1f}ms"
           f"  tls={r['tls_ms']:6.1f}ms  ttfb={r['ttfb_ms']:6.1f}ms"
           f"  ent={r['entropy']:.3f}  cert={r['cert_fp']}"
@@ -195,8 +196,9 @@ while True:
     # emit ProbeResult for verifier
     # compact: magic(H) node(B) tick(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s)
     try:
+        # magic(H) node(B) epoch(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s)
         pkt = struct.pack("!HBIHHHHH8s",
-                          PR_MAGIC, NODE_ID, tick,
+                          PR_MAGIC, NODE_ID, epoch,
                           int(r["dns_ms"]),
                           int(r["tcp_ms"]),
                           int(r["tls_ms"]),
