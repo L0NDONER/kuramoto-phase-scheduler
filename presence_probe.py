@@ -26,11 +26,35 @@ import collections, hashlib, math, socket, ssl, struct, sys, time
 AP_GRP  = "239.0.0.2"; AP_PORT = 7404
 AP_FMT  = ">HBBIfffffHQ"; AP_SIZE = struct.calcsize(AP_FMT); AP_MAGIC = 0x4158
 
-# ProbeResult multicast
-PR_GRP  = "239.0.0.6"; PR_PORT = 7460
-# magic(H) node_id(B) tick(I) dns_ms(H) tcp_ms(H) tls_ms(H) ttfb_ms(H) entropy_x100(H) cert_fp(8s) — 22 bytes
-PR_FMT  = "!HBIHHHHHHHHHHHHHHHe8s"   # simplified below
+# ProbeResult multicast — magic(H) node(B) epoch(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s) ip(4s)
+PR_GRP   = "239.0.0.6"; PR_PORT = 7460
+PR_FMT   = "!HBIHHHHH8s4s"
 PR_MAGIC = 0x5050   # "PP"
+
+# Known IP ranges per target hostname — IPs must fall inside or DNS is poisoned
+# Ranges are (network_int, mask_int) pairs
+def _cidr(net, bits):
+    n = struct.unpack("!I", socket.inet_aton(net))[0]
+    m = (0xFFFFFFFF << (32 - int(bits))) & 0xFFFFFFFF
+    return (n & m, m)
+
+_AWS = [_cidr("3.0.0.0", 8), _cidr("13.0.0.0", 8), _cidr("18.0.0.0", 8),
+        _cidr("52.0.0.0", 8), _cidr("54.0.0.0", 8), _cidr("99.77.0.0", 16),
+        _cidr("130.176.0.0", 16), _cidr("143.204.0.0", 16), _cidr("205.251.192.0", 19)]
+
+KNOWN_RANGES = {
+    "amazon.co.uk": _AWS,
+    "amazon.com":   _AWS,
+    "amazon.de":    _AWS,
+    "amazon.fr":    _AWS,
+}
+
+def _ip_ok(ip_str, host):
+    ranges = KNOWN_RANGES.get(host)
+    if not ranges:
+        return True   # unknown host — no assertion
+    ip_int = struct.unpack("!I", socket.inet_aton(ip_str))[0]
+    return any((ip_int & m) == n for n, m in ranges)
 
 HOST        = sys.argv[1] if len(sys.argv) > 1 else "amazon.co.uk"
 PORT        = int(sys.argv[2]) if len(sys.argv) > 2 else 443
@@ -58,6 +82,8 @@ def probe(host: str, port: int) -> dict:
     addrs = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
     dns_ms = (time.perf_counter() - t0) * 1000
     ip = addrs[0][4][0]
+    if not _ip_ok(ip, host):
+        raise ValueError(f"DNS_POISON  {host} resolved to {ip} — not in known ranges")
 
     # TCP connect
     raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -193,18 +219,17 @@ while True:
         for fl in flags:
             print(f"           !! {fl}", flush=True)
 
-    # emit ProbeResult for verifier
-    # compact: magic(H) node(B) tick(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s)
+    # emit ProbeResult — magic(H) node(B) epoch(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s) ip(4s)
     try:
-        # magic(H) node(B) epoch(I) dns(H) tcp(H) tls(H) ttfb(H) ent_x100(H) cert_fp(8s)
-        pkt = struct.pack("!HBIHHHHH8s",
+        pkt = struct.pack(PR_FMT,
                           PR_MAGIC, NODE_ID, epoch,
                           int(r["dns_ms"]),
                           int(r["tcp_ms"]),
                           int(r["tls_ms"]),
                           int(r["ttfb_ms"]),
                           int(r["entropy"] * 100),
-                          r["cert_fp"][:8].encode())
+                          r["cert_fp"][:8].encode(),
+                          socket.inet_aton(r["ip"]))
         pr_out.sendto(pkt, (PR_GRP, PR_PORT))
     except OSError:
         pass
