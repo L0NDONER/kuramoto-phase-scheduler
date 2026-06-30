@@ -34,6 +34,10 @@ PI2_DVFS_PORT = 7432   # dvfs neuron
 _CP_FMT   = ">HffIf"
 _CP_MAGIC = 0x4358   # "CX"
 
+# TickIntent wire format: magic(H) target_tick(I) payload(62s) — 68 bytes
+_TI_FMT   = ">HI62s"
+_TI_MAGIC = 0x5449   # "TI"
+
 # DCN_CONTROL wire format: magic(H) correction(f) — 6 bytes
 _DCN_FMT   = ">Hf"
 _DCN_SIZE  = struct.calcsize(_DCN_FMT)
@@ -156,6 +160,7 @@ commit_fd = open_fifo(FIFO_COMMIT)
 # ------------------------------------------------------------
 
 staged = []          # list of staged intents
+_tick_intents = {}   # target_tick → payload str; fire when carrier delivers tick >= target
 last_alignment = {}  # last AxisPulse packet
 commit_pending = False
 consumer_state = {"A": {}, "B": {}, "pathway": {"X": 0.0, "Y": 0.0}}
@@ -413,6 +418,19 @@ while True:
                     if not staged:
                         commit_pending = False
 
+                # Tick intents — fire on first tick >= target
+                if _tick_intents and pkt["locked"]:
+                    due = [t for t in _tick_intents if pkt["tick"] >= t]
+                    for t in due:
+                        payload = _tick_intents.pop(t)
+                        ti_pkt = struct.pack(_TI_FMT, _TI_MAGIC, t,
+                                             payload.encode()[:62].ljust(62, b"\x00"))
+                        try:
+                            _cerebellum_sock.sendto(ti_pkt, _cerebellum_addr)
+                            print(f"[tick-intent] FIRE  tick={pkt['tick']}  payload={payload!r}", flush=True)
+                        except OSError as _e:
+                            print(f"[tick-intent] send error: {_e}", flush=True)
+
         # -------------------------
         # RefleState — supervisory drain-window control
         # -------------------------
@@ -493,7 +511,18 @@ while True:
             if tag == FIFO_STAGE:
                 for msg in raw.decode("utf-8").splitlines():
                     msg = msg.strip()
-                    if msg:
+                    if not msg:
+                        continue
+                    if msg.startswith("AT:"):
+                        parts = msg.split(":", 2)
+                        if len(parts) == 3:
+                            try:
+                                target = int(parts[1])
+                                _tick_intents[target] = parts[2]
+                                print(f"[tick-intent] staged  tick={target}  payload={parts[2]!r}", flush=True)
+                            except ValueError:
+                                print(f"[tick-intent] bad format: {msg!r}", flush=True)
+                    else:
                         staged.append(msg)
                         print("Staged:", msg)
             else:
