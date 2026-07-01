@@ -7,6 +7,8 @@ import time
 import math
 import csv
 import sys
+import hashlib
+import hmac as _hmac
 
 DCN_ENABLED = "--no-dcn" not in sys.argv
 
@@ -34,8 +36,8 @@ PI2_DVFS_PORT = 7432   # dvfs neuron
 _CP_FMT   = ">HffIf"
 _CP_MAGIC = 0x4358   # "CX"
 
-# TickIntent wire format: magic(H) target_tick(I) payload(62s) — 68 bytes
-_TI_FMT   = ">HI62s"
+# TickIntent wire format: magic(H) target_tick(I) payload(62s) theta1(f) theta2(f) pd(f) pd_dev(f) — 84 bytes
+_TI_FMT   = ">HI62sffff"
 _TI_MAGIC = 0x5449   # "TI"
 
 # DCN_CONTROL wire format: magic(H) correction(f) — 6 bytes
@@ -48,8 +50,56 @@ DCN_PORT   = 7421
 _HOLD_FMT   = ">H"
 _HOLD_SIZE  = struct.calcsize(_HOLD_FMT)
 _HOLD_MAGIC = 0x484F  # "HO"
+
+# TickIntent Reply: magic(H) tick(I) response(62s) — 68 bytes
+_TIR_FMT   = ">HI62s"
+_TIR_SIZE  = struct.calcsize(_TIR_FMT)
+_TIR_MAGIC = 0x5452  # "TR"
+
+# DH exchange: magic(H) pubkey(32s) — 34 bytes
+_DHX_FMT   = ">H32s"
+_DHX_SIZE  = struct.calcsize(_DHX_FMT)
+_DHX_MAGIC = 0x4448  # "DH"
+
 DRIFT_THRESH_MIN = 0.05
 DRIFT_THRESH_MAX = 0.80
+
+# ── X25519 key management ─────────────────────────────────────────────────────
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PublicFormat, PrivateFormat, NoEncryption)
+
+_KEY_PATH = os.path.expanduser("~/.nazare_key")
+
+def _load_or_generate_key():
+    if os.path.exists(_KEY_PATH):
+        raw = open(_KEY_PATH, "rb").read()
+        return X25519PrivateKey.from_private_bytes(raw)
+    key = X25519PrivateKey.generate()
+    open(_KEY_PATH, "wb").write(
+        key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+    os.chmod(_KEY_PATH, 0o600)
+    return key
+
+_dh_private  = _load_or_generate_key()
+_dh_pubkey   = _dh_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+_shared_key  = None   # set after DH exchange
+_last_seen_tick = 0   # replay guard (sent side doesn't need this, EC2 does)
+
+def _do_dh(peer_pubkey_bytes):
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    peer = X25519PublicKey.from_public_bytes(peer_pubkey_bytes)
+    secret = _dh_private.exchange(peer)
+    fp = hashlib.sha256(secret).hexdigest()[:16]
+    print(f"[dh] shared secret established  fingerprint={fp}", flush=True)
+    return secret
+
+def _sign_intent(shared_key, tick, theta1, theta2, pd, pd_dev, payload):
+    """HMAC-SHA256 over tick+payload+phase nonce. Falls back to SHA256 if key not yet set."""
+    nonce = f"{tick}:{theta1:.6f}:{theta2:.6f}:{pd:.6f}:{pd_dev:.6f}:{payload}"
+    if shared_key:
+        return _hmac.new(shared_key, nonce.encode(), hashlib.sha256).hexdigest()[:16]
+    return hashlib.sha256(nonce.encode()).hexdigest()[:16]
 
 _cortex_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -58,7 +108,18 @@ import socket as _socket
 _cerebellum_ip   = _socket.gethostbyname(CEREBELLUM_HOST)
 _cerebellum_addr = (_cerebellum_ip, CEREBELLUM_PORT)
 _cerebellum_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_cerebellum_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+_cerebellum_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+_cerebellum_sock.bind(("", 7422))   # fixed port so EC2 reply always lands here
 _cerebellum_sock.setblocking(False)
+
+# Send DHX to EC2 at startup to initiate key exchange
+_dhx_pkt = struct.pack(_DHX_FMT, _DHX_MAGIC, _dh_pubkey)
+try:
+    _cerebellum_sock.sendto(_dhx_pkt, (_cerebellum_ip, CEREBELLUM_PORT))
+    print(f"[dh] sent pubkey to EC2  fp_local={hashlib.sha256(_dh_pubkey).hexdigest()[:8]}", flush=True)
+except OSError as _e:
+    print(f"[dh] send error: {_e}", flush=True)
 
 WAN_GAIN_PORT = 7411   # loopback — ns_wan_gain.py subscribes here
 
@@ -423,11 +484,16 @@ while True:
                     due = [t for t in _tick_intents if pkt["tick"] >= t]
                     for t in due:
                         payload = _tick_intents.pop(t)
+                        sig = _sign_intent(_shared_key, t, pkt["theta1"], pkt["theta2"],
+                                           pkt["pd"], pkt["pd_dev"], payload)
+                        signed = f"{payload}|{sig}"
                         ti_pkt = struct.pack(_TI_FMT, _TI_MAGIC, t,
-                                             payload.encode()[:62].ljust(62, b"\x00"))
+                                             signed.encode()[:62].ljust(62, b"\x00"),
+                                             pkt["theta1"], pkt["theta2"],
+                                             pkt["pd"], pkt["pd_dev"])
                         try:
                             _cerebellum_sock.sendto(ti_pkt, _cerebellum_addr)
-                            print(f"[tick-intent] FIRE  tick={pkt['tick']}  payload={payload!r}", flush=True)
+                            print(f"[tick-intent] FIRE  tick={pkt['tick']}  payload={payload!r}  sig={sig}", flush=True)
                         except OSError as _e:
                             print(f"[tick-intent] send error: {_e}", flush=True)
 
@@ -455,12 +521,15 @@ while True:
         # DCN_CONTROL from EC2
         # -------------------------
         elif tag == "dcn_udp":
-            data, _ = _cerebellum_sock.recvfrom(64)
+            data, _ = _cerebellum_sock.recvfrom(128)
             if len(data) < 2:
                 pass
             else:
                 magic = struct.unpack_from(">H", data)[0]
-                if magic == _HOLD_MAGIC:
+                if magic == _DHX_MAGIC and len(data) >= _DHX_SIZE:
+                    _, peer_pub = struct.unpack_from(_DHX_FMT, data)
+                    _shared_key = _do_dh(peer_pub)
+                elif magic == _HOLD_MAGIC:
                     _hold_pkt = struct.pack(_HOLD_FMT, _HOLD_MAGIC)
                     try:
                         _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_PORT))
@@ -471,6 +540,10 @@ while True:
                     except OSError:
                         pass
                     print("[dcn] HOLD from cerebellum → relayed to pi2")
+                elif magic == _TIR_MAGIC and len(data) >= _TIR_SIZE:
+                    _, tick, resp_b = struct.unpack_from(_TIR_FMT, data)
+                    response = resp_b.rstrip(b"\x00").decode("utf-8", errors="replace")
+                    print(f"[tick-intent-reply] tick={tick}  response={response!r}", flush=True)
                 elif magic == _DCN_MAGIC and len(data) >= _DCN_SIZE:
                     _, correction = struct.unpack_from(_DCN_FMT, data)
                     _last_dcn_corr = correction

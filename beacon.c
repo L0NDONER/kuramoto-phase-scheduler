@@ -1,7 +1,9 @@
 /*
  * beacon.c — Kuramoto oscillator beacon with PI lock controller
  *
- * Usage: sudo ./beacon <pi|pi2>
+ * Two instances run on the same host, each with a distinct node identity:
+ *   sudo ./beacon pi    — sid=1, couples to sid=2
+ *   sudo ./beacon pi2   — sid=2, couples to sid=1
  *
  * Packet format (network byte order, 24 bytes):
  *   uint16_t magic  = 0x1B4A
