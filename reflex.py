@@ -75,6 +75,11 @@ last_ap_t         = time.time()
 pd_dev = 0.0; temlum = 0.0; withdrawal = False
 pd_ema = 0.0; temlum_ema = 0.0   # smoothed inputs for threshold decisions
 
+# per-sid pd_dev EMA — 3 independent quartz witnesses, not one flapping scalar
+sid_pd_ema  = {}   # sid -> ema
+sid_last_t  = {}   # sid -> last packet time
+SID_STALE_S = 3.0
+
 
 def emit():
     try:
@@ -87,7 +92,8 @@ def go(new):
     global state, alert_clear_since, recover_since
     if new == state:
         return
-    print(f"[reflex] {_NAME[state]} → {_NAME[new]}", flush=True)
+    votes = {sid: round(ema, 4) for sid, ema in sid_pd_ema.items()}
+    print(f"[reflex] {_NAME[state]} → {_NAME[new]}  votes={votes}", flush=True)
     state = new
     alert_clear_since = recover_since = None
 
@@ -102,8 +108,11 @@ while True:
             if len(data) >= _AP_SIZE:
                 f = struct.unpack_from(_AP_FMT, data)
                 if f[0] == _AP_MAGIC and f[2]:   # locked only
-                    pd_dev    = f[7]
-                    pd_ema    = 0.20 * pd_dev    + 0.80 * pd_ema
+                    sid, pkt_pd_dev = f[1], f[7]
+                    prev = sid_pd_ema.get(sid, pkt_pd_dev)
+                    sid_pd_ema[sid] = 0.20 * pkt_pd_dev + 0.80 * prev
+                    sid_last_t[sid] = time.time()
+                    pd_dev    = pkt_pd_dev   # latest raw reading, for telemetry only
                     last_ap_t = time.time()
         elif tag == "ns":
             data, _ = ns_sock.recvfrom(32)
@@ -118,14 +127,23 @@ while True:
     stale  = (now - last_ap_t) > AP_STALE_S
     hot    = temlum_ema > PARK_TEMP
     warm   = temlum_ema > ALERT_TEMP
-    noisy  = pd_ema > ALERT_PD
-    ragged = pd_ema > WITHDRAW_PD
+
+    live_sids = [sid for sid, t in sid_last_t.items() if (now - t) < SID_STALE_S]
+    n_noisy   = sum(1 for sid in live_sids if sid_pd_ema[sid] > ALERT_PD)
+    n_ragged  = sum(1 for sid in live_sids if sid_pd_ema[sid] > WITHDRAW_PD)
+    quorum    = max(2, (len(live_sids) // 2) + 1) if live_sids else 1
+
+    # majority of witnesses, not whichever pairwise packet arrived last
+    noisy  = n_noisy  >= quorum
+    ragged = n_ragged >= quorum
 
     if state == CALM:
         if hot:                               go(PARK)
         elif withdrawal or ragged or stale:   go(WITHDRAW)
         elif warm or noisy:
-            print(f"[reflex] trigger warm={warm}(ema={temlum_ema:.3f}) noisy={noisy}(ema={pd_ema:.4f})", flush=True)
+            votes = {sid: round(sid_pd_ema[sid], 4) for sid in live_sids}
+            print(f"[reflex] trigger warm={warm}(temlum={temlum_ema:.3f}) "
+                  f"noisy={noisy} ({n_noisy}/{len(live_sids)} sids, quorum={quorum}) {votes}", flush=True)
             go(ALERT)
 
     elif state == ALERT:
