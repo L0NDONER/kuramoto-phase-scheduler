@@ -1,608 +1,77 @@
 #!/usr/bin/env python3
-import socket
-import struct
-import os
-import selectors
-import time
-import math
-import csv
-import sys
-import hashlib
-import hmac as _hmac
+"""
+nazare.py — Nazaré, a pure timing-plausibility verifier.
 
-DCN_ENABLED = "--no-dcn" not in sys.argv
+Proves exactly two things about an already-authenticated, schema-valid
+message:
 
-# ------------------------------------------------------------
-# Nazaré: staged‑intent, deferred‑commit semantic wave engine
-# ------------------------------------------------------------
+  1. cadence plausibility — the tick it claims to ride was actually
+     observed locally (see [[project_verification_lattice]]: this is the
+     quartz-timebase node, one layer above the monotonic counter, sitting
+     beside it as an incomparable claim — order vs duration).
+  2. timestamp plausibility — the latency between that local observation
+     and this message's arrival lies within Δ ± ε.
 
-MCAST_GRP = "239.0.0.2"
-MCAST_PORT = 7404
+Nothing else. It is not a truth source (it never inspects payload
+content), not a remote sensor (it only watches local multicast), and not
+a semantic authority (it has no notion of intent, identity, or decision).
 
-# Cortical output — LMDE slow integrator
-CORTEX_IP   = "10.0.0.175"
-CORTEX_PORT = 7410
+This file used to be a "staged-intent, deferred-commit semantic wave
+engine": FIFO-driven intent staging, cortex/cerebellum pulse relay, a DCN
+feedback loop, phase-geometry decision firing (A.leading, cycle=even,
+X/Y binary decisions), pi2 thermal relay, X25519 DH + HMAC signing. All
+of that was semantic/oracle behavior riding under the Nazaré name — real
+working infrastructure, but outside Nazaré's actual competence (timing
+only), and it has been removed rather than relocated: superseded by the
+reflex/consensus work done since. See [[project_nazare_timebase_placement]].
 
-# Cerebellar output — EC2 deep integrator (UDP → flaz.duckdns.org:7420; reply-to-sender for DCN)
-CEREBELLUM_HOST = "flaz.duckdns.org"
-CEREBELLUM_PORT = 7420
+nazare_wg.py and nazare_wan.py fork this into the two calibration domains
+that must never be merged (WG-tunnel timing vs raw WAN sine timing) — see
+carrier_verify.py, which calls whichever fork matches a packet's origin
+and never lets one verdict claim the other's domain.
+"""
+from dataclasses import dataclass
 
-# Pi2 shaper — DCN nudge relay (LAN UDP)
-PI2_IP        = "10.0.0.174"
-PI2_PORT      = 7430   # cpuset neuron
-PI2_DVFS_PORT = 7432   # dvfs neuron
 
-# CortexPulse wire format: magic(H) X(f) Y(f) cycle(I) margin(f) — 18 bytes
-_CP_FMT   = ">HffIf"
-_CP_MAGIC = 0x4358   # "CX"
+@dataclass
+class NazareConfig:
+    name: str
+    delta_s: float     # timing-plausibility window half-width
+    epsilon_s: float   # additional slack for jitter/drift in this domain
+    verdict_pass: str
+    verdict_fail: str
 
-# TickIntent wire format: magic(H) target_tick(I) payload(62s) theta1(f) theta2(f) pd(f) pd_dev(f) — 84 bytes
-_TI_FMT   = ">HI62sffff"
-_TI_MAGIC = 0x5449   # "TI"
 
-# DCN_CONTROL wire format: magic(H) correction(f) — 6 bytes
-_DCN_FMT   = ">Hf"
-_DCN_SIZE  = struct.calcsize(_DCN_FMT)
-_DCN_MAGIC = 0x4443   # "DC"
-DCN_PORT   = 7421
-
-# HOLD wire format: magic(H) — 2 bytes (cerebellum authoritative HOLD)
-_HOLD_FMT   = ">H"
-_HOLD_SIZE  = struct.calcsize(_HOLD_FMT)
-_HOLD_MAGIC = 0x484F  # "HO"
-
-# TickIntent Reply: magic(H) tick(I) response(62s) — 68 bytes
-_TIR_FMT   = ">HI62s"
-_TIR_SIZE  = struct.calcsize(_TIR_FMT)
-_TIR_MAGIC = 0x5452  # "TR"
-
-# DH exchange: magic(H) pubkey(32s) — 34 bytes
-_DHX_FMT   = ">H32s"
-_DHX_SIZE  = struct.calcsize(_DHX_FMT)
-_DHX_MAGIC = 0x4448  # "DH"
-
-DRIFT_THRESH_MIN = 0.05
-DRIFT_THRESH_MAX = 0.80
-
-# ── X25519 key management ─────────────────────────────────────────────────────
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding, PublicFormat, PrivateFormat, NoEncryption)
-
-_KEY_PATH = os.path.expanduser("~/.nazare_key")
-
-def _load_or_generate_key():
-    if os.path.exists(_KEY_PATH):
-        raw = open(_KEY_PATH, "rb").read()
-        return X25519PrivateKey.from_private_bytes(raw)
-    key = X25519PrivateKey.generate()
-    open(_KEY_PATH, "wb").write(
-        key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
-    os.chmod(_KEY_PATH, 0o600)
-    return key
-
-_dh_private  = _load_or_generate_key()
-_dh_pubkey   = _dh_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-_shared_key  = None   # set after DH exchange
-_last_seen_tick = 0   # replay guard (sent side doesn't need this, EC2 does)
-
-def _do_dh(peer_pubkey_bytes):
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-    peer = X25519PublicKey.from_public_bytes(peer_pubkey_bytes)
-    secret = _dh_private.exchange(peer)
-    fp = hashlib.sha256(secret).hexdigest()[:16]
-    print(f"[dh] shared secret established  fingerprint={fp}", flush=True)
-    return secret
-
-def _sign_intent(shared_key, tick, theta1, theta2, pd, pd_dev, payload):
-    """HMAC-SHA256 over tick+payload+phase nonce. Falls back to SHA256 if key not yet set."""
-    nonce = f"{tick}:{theta1:.6f}:{theta2:.6f}:{pd:.6f}:{pd_dev:.6f}:{payload}"
-    if shared_key:
-        return _hmac.new(shared_key, nonce.encode(), hashlib.sha256).hexdigest()[:16]
-    return hashlib.sha256(nonce.encode()).hexdigest()[:16]
-
-_cortex_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# Dedicated socket for EC2 cerebellum — sends CortexPulse, receives DCN replies
-import socket as _socket
-_cerebellum_ip   = _socket.gethostbyname(CEREBELLUM_HOST)
-_cerebellum_addr = (_cerebellum_ip, CEREBELLUM_PORT)
-_cerebellum_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-_cerebellum_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-_cerebellum_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-_cerebellum_sock.bind(("", 7422))   # fixed port so EC2 reply always lands here
-_cerebellum_sock.setblocking(False)
-
-# Send DHX to EC2 at startup to initiate key exchange
-_dhx_pkt = struct.pack(_DHX_FMT, _DHX_MAGIC, _dh_pubkey)
-try:
-    _cerebellum_sock.sendto(_dhx_pkt, (_cerebellum_ip, CEREBELLUM_PORT))
-    print(f"[dh] sent pubkey to EC2  fp_local={hashlib.sha256(_dh_pubkey).hexdigest()[:8]}", flush=True)
-except OSError as _e:
-    print(f"[dh] send error: {_e}", flush=True)
-
-WAN_GAIN_PORT = 7411   # loopback — ns_wan_gain.py subscribes here
-
-def send_cortex_pulse(x, y, cycle, margin):
-    pkt = struct.pack(_CP_FMT, _CP_MAGIC, x, y, cycle, margin)
-    try:
-        _cortex_sock.sendto(pkt, (CORTEX_IP, CORTEX_PORT))
-    except OSError:
-        pass
-    try:
-        _cortex_sock.sendto(pkt, ("127.0.0.1", WAN_GAIN_PORT))
-    except OSError:
-        pass
-    try:
-        _cerebellum_sock.sendto(pkt, _cerebellum_addr)
-    except OSError:
-        pass
-
-# FIFOs for stage/commit
-FIFO_STAGE = "/tmp/nazare_stage"
-FIFO_COMMIT = "/tmp/nazare_commit"
-
-# Create FIFOs if missing
-for f in (FIFO_STAGE, FIFO_COMMIT):
-    if not os.path.exists(f):
-        os.mkfifo(f)
-
-sel = selectors.DefaultSelector()
-
-# ------------------------------------------------------------
-# 1. Multicast listener for AxisPulse alignment
-# ------------------------------------------------------------
-
-def setup_axispulse_socket():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("", MCAST_PORT))
-
-    mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-    s.setblocking(False)
-    return s
-
-axispulse_sock = setup_axispulse_socket()
-sel.register(axispulse_sock, selectors.EVENT_READ, data="axispulse")
-
-# NucleusState-A subscription — withdrawal reflex signal
-_NS_FMT   = "!HfffBB"
-_NS_SIZE  = struct.calcsize(_NS_FMT)
-_NS_MAGIC = 0x4E53
-_NS_GRP   = "239.0.0.3"
-_NS_PORT  = 7440
-
-def _setup_ns_sock():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("", _NS_PORT))
-    mreq = struct.pack("4sl", socket.inet_aton(_NS_GRP), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    s.setblocking(False)
-    return s
-
-# DCN replies arrive on the same socket that sends CortexPulse (reply-to-sender NAT traversal)
-sel.register(_cerebellum_sock, selectors.EVENT_READ, data="dcn_udp")
-
-# RefleState subscription — global supervisory state (replaces per-component withdrawal logic)
-_RS_GRP  = "239.0.0.4"; _RS_PORT = 7450
-_RS_MAGIC = 0x5253; _RS_FMT = "!HBff"; _RS_SIZE = struct.calcsize("!HBff")
-_RS_CALM=0; _RS_ALERT=1; _RS_WITHDRAW=2; _RS_PARK=3; _RS_RECOVER=4
-
-def _setup_rs_sock():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("", _RS_PORT))
-    mreq = struct.pack("4sl", socket.inet_aton(_RS_GRP), socket.INADDR_ANY)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    s.setblocking(False)
-    return s
-
-_rs_sock = _setup_rs_sock()
-sel.register(_rs_sock, selectors.EVENT_READ, data="reflex")
-_reflex_state = _RS_CALM
-
-# ------------------------------------------------------------
-# 2. FIFOs for staged intents
-# ------------------------------------------------------------
-
-def open_fifo(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    sel.register(fd, selectors.EVENT_READ, data=path)
-    return fd
-
-stage_fd  = open_fifo(FIFO_STAGE)
-commit_fd = open_fifo(FIFO_COMMIT)
-
-# ------------------------------------------------------------
-# Internal state
-# ------------------------------------------------------------
-
-staged = []          # list of staged intents
-_tick_intents = {}   # target_tick → payload str; fire when carrier delivers tick >= target
-last_alignment = {}  # last AxisPulse packet
-commit_pending = False
-consumer_state = {"A": {}, "B": {}, "pathway": {"X": 0.0, "Y": 0.0}}
-theta_prev = {"A": None, "B": None}   # for descent detection
-cycle = 0                              # increments each full A drain window
-
-# Pathway stability / synaptic scaling
-DRIFT_THRESH = 0.25   # pd_dev above this = incoherent geometry
-DECAY_RATE   = 0.95   # multiplicative decay per unstable tick
-
-# Episode logging
-EPISODE_CYCLES = 100
-LMDE_TEMP_FILE = "/tmp/lmde_temp"
-_csv_path = f"/tmp/nazare_episode{'_nodcn' if not DCN_ENABLED else ''}.csv"
-_csv_file = open(_csv_path, "w", newline="")
-_csv_writer = csv.writer(_csv_file)
-_csv_writer.writerow(["ts", "cycle", "pd_dev", "drift_thresh", "dcn_correction", "lmde_temp"])
-_csv_file.flush()
-
-_ep_start_cycle = 0
-_ep_pd_devs     = []
-_ep_temps       = []
-_last_dcn_corr  = 0.0
-
-def _read_lmde_temp():
-    try:
-        return float(open(LMDE_TEMP_FILE).read().strip())
-    except Exception:
-        return float("nan")
-
-def _log_tick(cycle, pd_dev, dcn_corr, lmde_temp):
-    thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
-    _csv_writer.writerow([f"{time.time():.3f}", cycle, f"{pd_dev:.4f}",
-                          f"{thresh:.3f}", f"{dcn_corr:.5f}", f"{lmde_temp:.1f}"])
-    _csv_file.flush()
-    _ep_pd_devs.append(pd_dev)
-    if not math.isnan(lmde_temp):
-        _ep_temps.append(lmde_temp)
-
-def _check_episode(cycle):
-    global _ep_start_cycle, _ep_pd_devs, _ep_temps
-    if cycle - _ep_start_cycle < EPISODE_CYCLES:
-        return
-    n = len(_ep_pd_devs)
-    if n == 0:
-        return
-    mean_pd = sum(_ep_pd_devs) / n
-    var_pd  = sum((v - mean_pd)**2 for v in _ep_pd_devs) / n
-    mean_t  = sum(_ep_temps) / len(_ep_temps) if _ep_temps else float("nan")
-    var_t   = (sum((v - mean_t)**2 for v in _ep_temps) / len(_ep_temps)
-               if len(_ep_temps) > 1 else float("nan"))
-    dcn_tag = "DCN=ON " if DCN_ENABLED else "DCN=OFF"
-    print(f"[episode] {dcn_tag}  cycles {_ep_start_cycle}–{cycle}"
-          f"  pd_dev μ={mean_pd:.4f} σ²={var_pd:.6f}"
-          f"  temp μ={mean_t:.1f}°C σ²={var_t:.2f}")
-    _ep_start_cycle = cycle
-    _ep_pd_devs = []
-    _ep_temps   = []
-
-print(f"Nazaré running. DCN={'ON' if DCN_ENABLED else 'OFF'}  CSV→{_csv_path}")
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-
-# AxisPulse wire format (38 bytes, big-endian):
-# H  magic, B sid, B locked, I tick,
-# f theta1, f theta2, f pd, f pd_dev, f load_avg,
-# H drains, Q t0_ns
-_AP_FMT  = ">HBBIfffffHQ"
-_AP_SIZE = struct.calcsize(_AP_FMT)   # 38
-_AP_MAGIC = 0x4158
-
-def parse_axispulse_packet(data):
-    if len(data) < _AP_SIZE:
-        return None
-    fields = struct.unpack_from(_AP_FMT, data)
-    magic, sid, locked, tick, theta1, theta2, pd, pd_dev, load_avg, drains, t0_ns = fields
-    if magic != _AP_MAGIC:
-        return None
-    return dict(sid=sid, locked=locked, tick=tick,
-                theta1=theta1, theta2=theta2,
-                pd=pd, pd_dev=pd_dev, load_avg=load_avg,
-                drains=drains, t0_ns=t0_ns)
-
-_DRAIN_WIN_NORMAL  = 0.25   # rad either side of drain point — CALM
-_DRAIN_WIN_ALERT   = 0.18   # narrowed under alert
-_DRAIN_WIN_RECOVER = 0.15   # restricted during recovery
-_DRAIN_WIN_CLAMP   = 0.08   # WITHDRAW / PARK
-_DRAIN_WIN = _DRAIN_WIN_NORMAL
-
-def _a_leads(pkt):
-    """True when A is ahead of anti-phase: signed pd > π."""
-    signed = (pkt["theta1"] - pkt["theta2"]) % (2 * math.pi)
-    return signed > math.pi
-
-def _eval_one(cond, pkt):
-    """Evaluate a single condition token."""
-    if not cond:
-        return True
-    if cond == "A.descending":
-        return theta_prev["A"] is not None and pkt["theta1"] < theta_prev["A"]
-    if cond == "A.ascending":
-        return theta_prev["A"] is not None and pkt["theta1"] > theta_prev["A"]
-    if cond == "B.descending":
-        return theta_prev["B"] is not None and pkt["theta2"] < theta_prev["B"]
-    if cond == "B.ascending":
-        return theta_prev["B"] is not None and pkt["theta2"] > theta_prev["B"]
-    if cond == "A.leading":
-        return _a_leads(pkt)
-    if cond == "A.following":
-        return not _a_leads(pkt)
-    if cond == "cycle=even":
-        return cycle % 2 == 0
-    if cond == "cycle=odd":
-        return cycle % 2 == 1
-    if "." in cond and "=" in cond:
-        who, rest = cond.split(".", 1)
-        key, _, val = rest.partition("=")
-        return consumer_state.get(who, {}).get(key) == val
-    return True
-
-def _eval_condition(cond, pkt):
-    """Evaluate condition string; '+' = AND, '|' = OR."""
-    if not cond:
-        return True
-    if "+" in cond:
-        return all(_eval_one(c.strip(), pkt) for c in cond.split("+"))
-    if "|" in cond:
-        return any(_eval_one(c.strip(), pkt) for c in cond.split("|"))
-    return _eval_one(cond, pkt)
-
-def _apply_intent(target, body, theta):
+class Nazare:
     """
-    Apply intent body to target consumer. Body forms:
-      key=val          set state
-      key+=num         increment float state
-      key-=num         decrement float state
-      action           plain fire
-    Target may differ from the firing consumer (cross-consumer plasticity).
+    Feed it locally-observed ticks as they happen (`observe`), then check
+    a message's claimed tick against that local observation (`check`).
+    Never trusts a claim on its own say-so; the local observation log is
+    the only ground truth it has, and it is never derived from the
+    message being checked.
     """
-    st = consumer_state[target]
-    if "+=" in body:
-        key, _, val = body.partition("+=")
-        st[key] = float(st.get(key, 0)) + float(val)
-        return f"{target}.{key} += {val} → {st[key]:.4f}"
-    elif "-=" in body:
-        key, _, val = body.partition("-=")
-        st[key] = float(st.get(key, 0)) - float(val)
-        return f"{target}.{key} -= {val} → {st[key]:.4f}"
-    elif "=" in body:
-        key, _, val = body.partition("=")
-        st[key] = val
-        return f"{target}.{key} = {val}"
-    else:
-        return f"{body} fired"
 
-def _parse_intent(raw):
-    """Parse 'PREFIX:body?condition:flags' → (prefix, body, cond, flags)."""
-    prefix, _, rest = raw.partition(":")
-    flags_part = ""
-    if rest.count(":") >= 1 and "?" in rest:
-        body_cond, _, flags_part = rest.rpartition(":")
-    elif rest.count(":") >= 1 and "?" not in rest:
-        body_cond, _, flags_part = rest.rpartition(":")
-    else:
-        body_cond = rest
-    body, _, cond = body_cond.partition("?")
-    return prefix, body.strip(), cond.strip(), flags_part.strip()
+    def __init__(self, config: NazareConfig):
+        self.config = config
+        self._seen_at = {}   # tick -> local monotonic arrival time
 
-def _apply_autonomous_decay(pkt):
-    """
-    Apply multiplicative decay to pathway weights if drift is high.
-    Maintains synaptic homeostasis at the cerebellar level.
-    Called before intent evaluation so intents always see current valid state.
-    """
-    if pkt["pd_dev"] > consumer_state.get("_drift_thresh", DRIFT_THRESH):
-        pw = consumer_state["pathway"]
-        pw["X"] = float(pw.get("X", 0)) * DECAY_RATE
-        pw["Y"] = float(pw.get("Y", 0)) * DECAY_RATE
-        x, y = pw["X"], pw["Y"]
-        print(f"[stability] pd_dev={pkt['pd_dev']:.3f}  decay → X={x:.4f} Y={y:.4f}")
-        send_cortex_pulse(x, y, cycle, abs(x - y))
+    def observe(self, tick, arrival_monotonic):
+        self._seen_at[tick] = arrival_monotonic
 
-def _try_fire(staged, pkt):
-    """Fire intents in their drain window that pass their condition."""
-    global cycle
-    theta1 = pkt["theta1"]
-    theta2 = pkt["theta2"]
-    a_win = theta1 < _DRAIN_WIN or theta1 > (2*math.pi - _DRAIN_WIN)
-    b_win = abs(theta2 - math.pi) < _DRAIN_WIN
-    if a_win:
-        cycle += 1
-    remaining = []
-    for intent in staged:
-        prefix, body, cond, flags = _parse_intent(intent)
-        in_win = (prefix == "A" and a_win) or (prefix == "B" and b_win)
-        theta = theta1 if prefix == "A" else theta2
-        if in_win and _eval_condition(cond, pkt):
-            # body may target another consumer: "B.key+=val" fired by A
-            if "." in body and body.split(".")[0] in consumer_state:
-                target, _, tbody = body.partition(".")
-            else:
-                target, tbody = prefix, body
-            msg = _apply_intent(target, tbody, theta)
-            print(f"[{prefix}→{target}] θ={theta:.3f}  cycle={cycle}  {msg}")
-            # binary decision readout + cortex relay when pathway weights updated
-            if target == "pathway":
-                pw = consumer_state["pathway"]
-                x, y = float(pw.get("X", 0)), float(pw.get("Y", 0))
-                decision = "YES (A leads)" if x > y else "NO  (B leads)"
-                margin = abs(x - y)
-                print(f"  ↳ decision: {decision}  X={x:.2f} Y={y:.2f} margin={margin:.2f}")
-                send_cortex_pulse(x, y, cycle, margin)
-            if "repeat" in flags.split(","):
-                remaining.append(intent)   # re-stage for next cycle
-        else:
-            remaining.append(intent)
-    theta_prev["A"] = theta1
-    theta_prev["B"] = theta2
-    return remaining
+    def check(self, claimed_tick, t_arrival):
+        """
+        Returns (ok, verdict, detail). `t_arrival` is when *this* verifier
+        received the message asserting `claimed_tick` — never a time the
+        message itself carries.
+        """
+        seen_at = self._seen_at.get(claimed_tick)
+        if seen_at is None:
+            return False, self.config.verdict_fail, (
+                f"tick {claimed_tick} never observed locally — cadence unverifiable")
 
-# ------------------------------------------------------------
-# Main loop
-# ------------------------------------------------------------
-
-print(f"Nazaré: AxisPulse + FIFO stage/commit.")
-
-while True:
-    events = sel.select(timeout=0.1)
-
-    for key, _ in events:
-        tag = key.data
-
-        # -------------------------
-        # AxisPulse alignment
-        # -------------------------
-        if tag == "axispulse":
-            data, _ = axispulse_sock.recvfrom(2048)
-            pkt = parse_axispulse_packet(data)
-            if pkt:
-                last_alignment = pkt
-                if pkt["locked"]:
-                    _apply_autonomous_decay(pkt)
-                    thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
-                    pd_dev = pkt["pd_dev"]
-                    x_sig = max(0.0, 1.0 - pd_dev / thresh)
-                    y_sig = min(1.0, pd_dev / thresh)
-                    send_cortex_pulse(x_sig, y_sig, cycle, abs(x_sig - y_sig))
-                    lmde_temp = _read_lmde_temp()
-                    _log_tick(cycle, pkt["pd_dev"], _last_dcn_corr, lmde_temp)
-                    _check_episode(cycle)
-                if commit_pending and staged and pkt["locked"]:
-                    staged = _try_fire(staged, pkt)
-                    if not staged:
-                        commit_pending = False
-
-                # Tick intents — fire on first tick >= target
-                if _tick_intents and pkt["locked"]:
-                    due = [t for t in _tick_intents if pkt["tick"] >= t]
-                    for t in due:
-                        payload = _tick_intents.pop(t)
-                        sig = _sign_intent(_shared_key, t, pkt["theta1"], pkt["theta2"],
-                                           pkt["pd"], pkt["pd_dev"], payload)
-                        signed = f"{payload}|{sig}"
-                        ti_pkt = struct.pack(_TI_FMT, _TI_MAGIC, t,
-                                             signed.encode()[:62].ljust(62, b"\x00"),
-                                             pkt["theta1"], pkt["theta2"],
-                                             pkt["pd"], pkt["pd_dev"])
-                        try:
-                            _cerebellum_sock.sendto(ti_pkt, _cerebellum_addr)
-                            print(f"[tick-intent] FIRE  tick={pkt['tick']}  payload={payload!r}  sig={sig}", flush=True)
-                        except OSError as _e:
-                            print(f"[tick-intent] send error: {_e}", flush=True)
-
-        # -------------------------
-        # RefleState — supervisory drain-window control
-        # -------------------------
-        elif tag == "reflex":
-            data, _ = _rs_sock.recvfrom(16)
-            if len(data) >= _RS_SIZE:
-                fields = struct.unpack_from(_RS_FMT, data)
-                if fields[0] == _RS_MAGIC:
-                    prev = _reflex_state
-                    _reflex_state = fields[1]
-                    win = {_RS_CALM:     _DRAIN_WIN_NORMAL,
-                           _RS_ALERT:    _DRAIN_WIN_ALERT,
-                           _RS_RECOVER:  _DRAIN_WIN_RECOVER,
-                           _RS_WITHDRAW: _DRAIN_WIN_CLAMP,
-                           _RS_PARK:     _DRAIN_WIN_CLAMP}.get(_reflex_state, _DRAIN_WIN_NORMAL)
-                    if win != _DRAIN_WIN:
-                        _DRAIN_WIN = win
-                        _rs_names = ["CALM","ALERT","WITHDRAW","PARK","RECOVER"]
-                        print(f"[nazare] reflex={_rs_names[_reflex_state]}  DRAIN_WIN→{_DRAIN_WIN:.2f}", flush=True)
-
-        # -------------------------
-        # DCN_CONTROL from EC2
-        # -------------------------
-        elif tag == "dcn_udp":
-            data, _ = _cerebellum_sock.recvfrom(128)
-            if len(data) < 2:
-                pass
-            else:
-                magic = struct.unpack_from(">H", data)[0]
-                if magic == _DHX_MAGIC and len(data) >= _DHX_SIZE:
-                    _, peer_pub = struct.unpack_from(_DHX_FMT, data)
-                    _shared_key = _do_dh(peer_pub)
-                elif magic == _HOLD_MAGIC:
-                    _hold_pkt = struct.pack(_HOLD_FMT, _HOLD_MAGIC)
-                    try:
-                        _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_PORT))
-                    except OSError:
-                        pass
-                    try:
-                        _cortex_sock.sendto(_hold_pkt, (PI2_IP, PI2_DVFS_PORT))
-                    except OSError:
-                        pass
-                    print("[dcn] HOLD from cerebellum → relayed to pi2")
-                elif magic == _TIR_MAGIC and len(data) >= _TIR_SIZE:
-                    _, tick, resp_b = struct.unpack_from(_TIR_FMT, data)
-                    response = resp_b.rstrip(b"\x00").decode("utf-8", errors="replace")
-                    print(f"[tick-intent-reply] tick={tick}  response={response!r}", flush=True)
-                elif magic == _DCN_MAGIC and len(data) >= _DCN_SIZE:
-                    _, correction = struct.unpack_from(_DCN_FMT, data)
-                    _last_dcn_corr = correction
-                    _dcn_pkt = struct.pack(_DCN_FMT, _DCN_MAGIC, correction)
-                    try:
-                        _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_PORT))
-                    except OSError as _e:
-                        print(f"[dcn] relay PI2 error: {_e}", flush=True)
-                    try:
-                        _cortex_sock.sendto(_dcn_pkt, (PI2_IP, PI2_DVFS_PORT))
-                    except OSError as _e:
-                        print(f"[dcn] relay DVFS error: {_e}", flush=True)
-                    if DCN_ENABLED:
-                        thresh = consumer_state.get("_drift_thresh", DRIFT_THRESH)
-                        thresh = max(DRIFT_THRESH_MIN, min(DRIFT_THRESH_MAX, thresh + correction))
-                        consumer_state["_drift_thresh"] = thresh
-                        print(f"[dcn] correction={correction:+.4f}  DRIFT_THRESH→{thresh:.3f}")
-
-        # -------------------------
-        # Stage FIFO
-        # -------------------------
-        elif tag in (FIFO_STAGE, FIFO_COMMIT):
-            fd = key.fd
-            try:
-                raw = os.read(fd, 4096)
-            except BlockingIOError:
-                raw = b""
-            if not raw:
-                # EOF — writer disconnected; reopen
-                sel.unregister(fd)
-                os.close(fd)
-                path = tag
-                if path == FIFO_STAGE:
-                    stage_fd = open_fifo(path)
-                else:
-                    commit_fd = open_fifo(path)
-                continue
-            if tag == FIFO_STAGE:
-                for msg in raw.decode("utf-8").splitlines():
-                    msg = msg.strip()
-                    if not msg:
-                        continue
-                    if msg.startswith("AT:"):
-                        parts = msg.split(":", 2)
-                        if len(parts) == 3:
-                            try:
-                                target = int(parts[1])
-                                _tick_intents[target] = parts[2]
-                                print(f"[tick-intent] staged  tick={target}  payload={parts[2]!r}", flush=True)
-                            except ValueError:
-                                print(f"[tick-intent] bad format: {msg!r}", flush=True)
-                    else:
-                        staged.append(msg)
-                        print("Staged:", msg)
-            else:
-                msg = raw.decode("utf-8").strip()
-                if msg:
-                    print("Commit requested:", msg)
-                    commit_pending = True
-
-    # If commit requested but no alignment yet, keep waiting
-    time.sleep(0.01)
+        latency = t_arrival - seen_at
+        window = self.config.delta_s + self.config.epsilon_s
+        if -self.config.epsilon_s <= latency <= window:
+            return True, self.config.verdict_pass, f"latency={latency*1000:.1f}ms within Δ±ε"
+        return False, self.config.verdict_fail, (
+            f"latency={latency*1000:.1f}ms outside Δ±ε ({window*1000:.1f}ms)")

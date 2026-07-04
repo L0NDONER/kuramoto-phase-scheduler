@@ -96,6 +96,9 @@ def wrap_pi(x):
 
 SID_BY_HOST = {"pi": 1, "pi2": 2, "mint": 3}
 
+CLOCK = time.CLOCK_MONOTONIC_RAW
+now_raw = lambda: time.clock_gettime(CLOCK)
+
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in SID_BY_HOST:
@@ -117,13 +120,13 @@ def main():
     sel = selectors.DefaultSelector()
     sel.register(raw_in, selectors.EVENT_READ, data="raw")
 
-    t0 = time.time()
+    t0 = now_raw()
     tick = 0
     peers = {}   # peer_sid -> {theta, omega, t, pd_prev, pd_ema}
 
-    next_tick_at = time.time()
+    next_tick_at = now_raw()
     while True:
-        timeout = max(0.0, next_tick_at - time.time())
+        timeout = max(0.0, next_tick_at - now_raw())
         for key, _ in sel.select(timeout=timeout):
             data, _ = raw_in.recvfrom(64)
             if len(data) < RAW_SIZE:
@@ -134,9 +137,9 @@ def main():
             peer = peers.setdefault(f[1], {"pd_prev": None, "pd_ema": 0.0})
             peer["theta"] = f[3]
             peer["omega"] = f[4]
-            peer["t"] = time.time()
+            peer["t"] = now_raw()
 
-        now = time.time()
+        now = now_raw()
         if now < next_tick_at:
             continue
         next_tick_at = now + TICK_S
@@ -144,9 +147,14 @@ def main():
         if tick and tick % RESAMPLE_EVERY == 0:
             new_ppm = resample()
             if new_ppm != ppm:
+                theta_now = (omega * (now - t0)) % (2 * math.pi)
                 ppm = new_ppm
                 omega = OMEGA0 * (1.0 + ppm * 1e-6)
-                t0 = now   # reset phase anchor so theta stays continuous across the omega step
+                # re-anchor t0 so the new omega reproduces theta_now at this
+                # instant instead of snapping theta to 0 (old `t0 = now` was
+                # not actually continuous — it discarded the phase reached
+                # so far and restarted from zero)
+                t0 = now - theta_now / omega
                 print(f"[quartz] sid={sid} resampled freq_ppm={ppm:.6f} omega={omega:.9f}", flush=True)
 
         theta_self = (omega * (now - t0)) % (2 * math.pi)
