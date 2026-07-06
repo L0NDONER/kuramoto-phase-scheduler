@@ -16,11 +16,16 @@ Usage:
   python3 glyph/glyph_intent.py boost
   python3 glyph/glyph_intent.py boost2
 """
-import socket, struct, sys
+import socket, struct, sys, time
+sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
+from phase_auth import gate_check
 
 READER_IP  = "127.0.0.1"
 GLYPH_PORT = 7408
 MAGIC      = 0x474C
+
+PRINTER_IP   = "10.0.0.82"
+PRINTER_PORT = 9100
 
 ADVISORY  = 0
 DIRECTIVE = 1
@@ -35,10 +40,29 @@ def send(intent: int):
     sock.sendto(struct.pack(">HB", MAGIC, intent), (READER_IP, GLYPH_PORT))
     sock.close()
 
+def print_alarm():
+    body = f"ALARM\r\n{time.ctime()}\r\n\f"
+    sock = socket.create_connection((PRINTER_IP, PRINTER_PORT), timeout=5)
+    sock.sendall(body.encode("ascii"))
+    sock.close()
+
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1].lower() not in NAMES:
         print(f"usage: {sys.argv[0]} advisory|directive|alarm|boost|boost2")
         sys.exit(1)
-    intent = NAMES[sys.argv[1].lower()]
+    name = sys.argv[1].lower()
+    intent = NAMES[name]
+
+    if intent == ALARM:
+        print("[glyph] phase-auth gate...", flush=True)
+        if not gate_check():
+            print("[glyph] GATE BLOCKED — no LAN prover responded", flush=True)
+            sys.exit(1)
+
     send(intent)
-    print(f"intent: {sys.argv[1].lower()}", flush=True)
+    print(f"intent: {name}", flush=True)
+
+    if intent == ALARM:
+        print(f"[print] → {PRINTER_IP}:{PRINTER_PORT}", flush=True)
+        print_alarm()
+        print("[print] sent", flush=True)

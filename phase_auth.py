@@ -22,7 +22,9 @@ Usage:
   python3 phase_auth.py [--loop]   loop issues a challenge every 10s
   python3 phase_auth.py            single challenge then exit
 """
-import hashlib, os, selectors, socket, struct, sys, time
+import hashlib, ipaddress, os, selectors, socket, struct, sys, time
+
+PROVER_SUBNET = ipaddress.ip_network("10.0.0.0/24")
 
 # AxisPulse
 AP_GRP   = "239.0.0.2"; AP_PORT  = 7404
@@ -120,6 +122,9 @@ def run_challenge():
             if key.data == "resp":
                 data, addr = resp_sock.recvfrom(256)
                 if len(data) >= RESP_SIZE:
+                    if ipaddress.ip_address(addr[0]) not in PROVER_SUBNET:
+                        print(f"[phase_auth] IGNORED  prover={addr[0]} outside {PROVER_SUBNET}", flush=True)
+                        continue
                     magic, r_nonce, digest = struct.unpack_from(RESP_FMT, data)
                     if magic == RESP_MAGIC and r_nonce == nonce:
                         if digest == expected_hash:

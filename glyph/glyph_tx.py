@@ -16,6 +16,9 @@ READER_IP  = "127.0.0.1"
 GLYPH_PORT = 7408
 MAGIC      = 0x474C
 
+PRINTER_IP   = "10.0.0.82"
+PRINTER_PORT = 9100
+
 def transmit(text):
     print("[glyph] phase-auth gate...", flush=True)
     if not gate_check():
@@ -29,6 +32,12 @@ def transmit(text):
     sock.close()
     return True
 
+def print_job(text):
+    body = text.replace("\n", "\r\n") + "\r\n\f"
+    sock = socket.create_connection((PRINTER_IP, PRINTER_PORT), timeout=5)
+    sock.sendall(body.encode("ascii", errors="replace"))
+    sock.close()
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         text = " ".join(sys.argv[1:])
@@ -39,3 +48,6 @@ if __name__ == "__main__":
     print(f"TX → {text!r}", flush=True)
     if transmit(text):
         print("done", flush=True)
+        print(f"[print] → {PRINTER_IP}:{PRINTER_PORT}", flush=True)
+        print_job(text)
+        print("[print] sent", flush=True)
