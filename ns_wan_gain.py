@@ -46,6 +46,16 @@ EC_MOD_SCALE = 0.02         # e_C for full mod depth (E_UNPARK=0.004, headroom ~
 ALPHA_ATTACK  = 0.05
 ALPHA_RELEASE = 0.30
 
+# Sanity bounds on raw NucleusState — 2-3x the design range, wide enough to
+# never clip a legitimate transient but tight enough to catch a diverging/
+# unlocked upstream sender. Rejected packets are dropped, not clamped —
+# clamping still feeds a maximally-deflected value into the EMA every tick,
+# which pins it at the edge just as effectively as the raw garbage would.
+TEMLUM_SANITY_MAX = 3.0      # HEADROOM=1.5, so 2x margin
+EC_SANITY_MAX     = 0.5      # EC_SCALE=0.20, so 2.5x margin
+NS_STALE_S        = 60.0     # no valid NucleusState this long → decay to neutral
+AP_WARN_S         = 60.0     # no locked AxisPulse tick this long → log loudly
+
 # Wire formats
 AP_MAGIC  = 0x4158;  AP_FMT  = "!HBBIfffffHQ"   # AxisPulse 38 bytes
 NS_MAGIC  = 0x4E53;  NS_FMT  = "!HfffBB"         # NucleusState 16 bytes
@@ -63,10 +73,14 @@ def tc_run(args):
     subprocess.run([TC] + args, check=True)
 
 def setup_qdisc():
+    # Start at G_BASE, not RATE_MAX — until the first locked AxisPulse tick
+    # arrives there's no signal to justify anything above the neutral floor.
+    # Absence of input should degrade toward boring, not park at the ceiling.
+    safe_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * G_BASE)
     subprocess.run([TC, "qdisc", "del", "dev", IFACE, "root"], capture_output=True)
     tc_run(["qdisc", "add", "dev", IFACE, "root", "handle", "1:", "htb", "default", "10"])
     tc_run(["class", "add", "dev", IFACE, "parent", "1:", "classid", CLASSID,
-            "htb", "rate", f"{RATE_MAX}mbit", "ceil", f"{RATE_MAX}mbit",
+            "htb", "rate", f"{safe_mbit}mbit", "ceil", f"{safe_mbit}mbit",
             "burst", "1500k", "quantum", "1514"])
 
 def teardown_qdisc():
@@ -86,6 +100,21 @@ def _mcast_sock(port, grp):
                  socket.inet_aton(grp) + socket.inet_aton("0.0.0.0"))
     s.setblocking(False)
     return s
+
+
+def warn_if_substrate_down(last_locked_t, last_warn_t):
+    """No locked AxisPulse tick for AP_WARN_S: log loudly (rate-limited) so
+    'entire substrate absent' shows up somewhere instead of being invisible —
+    the qdisc is already sitting at the safe G_BASE floor from setup_qdisc()."""
+    now = time.time()
+    since = None if last_locked_t is None else now - last_locked_t
+    if since is None or since > AP_WARN_S:
+        if now - last_warn_t > AP_WARN_S:
+            since_str = "never" if last_locked_t is None else f"{since:.0f}s ago"
+            print(f"[ns_wan_gain] SUBSTRATE DOWN — no locked AxisPulse tick "
+                  f"(last locked {since_str}), holding at G_BASE", flush=True)
+            return now
+    return last_warn_t
 
 
 def drain(sock, size):
@@ -124,6 +153,11 @@ def main():
     last_intent   = 1
     reflex_state  = _RS_CALM
     rs_last_t     = time.time()
+    last_valid_ns_t = time.time()
+    ns_accepted   = 0
+    ns_rejected   = 0
+    last_locked_t = None
+    last_ap_warn_t = 0.0
 
     print(f"[ns_wan_gain] {IFACE} {CLASSID}  {RATE_MIN}–{RATE_MAX}Mbit  "
           f"steps={N_STEPS}  G_BASE={G_BASE}", flush=True)
@@ -144,14 +178,38 @@ def main():
         if raw and len(raw) >= NS_SIZE:
             magic, e_C, temlum, pd_pop, intent, _wd = struct.unpack(NS_FMT, raw[:NS_SIZE])
             if magic == NS_MAGIC:
-                a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
-                temlum_ema = a * temlum + (1 - a) * temlum_ema
-                e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
+                if abs(temlum) > TEMLUM_SANITY_MAX or abs(e_C) > EC_SANITY_MAX:
+                    ns_rejected += 1
+                else:
+                    now_ns = time.time()
+                    if now_ns - last_valid_ns_t > NS_STALE_S:
+                        # EMA was frozen (or decayed) through a corrupt/silent
+                        # stretch — reseed directly instead of slow-blending
+                        # fresh data into a stale average.
+                        temlum_ema = temlum
+                        e_C_ema    = e_C
+                        print(f"[ns_wan_gain] NucleusState recovered after "
+                              f"{now_ns - last_valid_ns_t:.0f}s — EMA reseeded", flush=True)
+                    else:
+                        a = ALPHA_ATTACK if temlum > temlum_ema else ALPHA_RELEASE
+                        temlum_ema = a * temlum + (1 - a) * temlum_ema
+                        e_C_ema    = 0.10 * e_C + 0.90 * e_C_ema
+                    last_valid_ns_t = now_ns
+                    ns_accepted += 1
+
+        # -- decay EMA toward neutral if nothing valid for a long stretch --
+        # (garbage sender, dead tunnel, or unlocked Pi2 — don't let a stale
+        # reading keep biasing gain indefinitely)
+        ns_stale = time.time() - last_valid_ns_t > NS_STALE_S
+        if ns_stale:
+            temlum_ema *= 0.98
+            e_C_ema    *= 0.98
 
         # -- wait for a locked AxisPulse tick --
         try:
             raw, _ = ap_sock.recvfrom(64)
         except TimeoutError:
+            last_ap_warn_t = warn_if_substrate_down(last_locked_t, last_ap_warn_t)
             continue
 
         if not raw or len(raw) < AP_SIZE:
@@ -160,7 +218,10 @@ def main():
         magic, sid, locked, tick = fields[0], fields[1], fields[2], fields[3]
         theta1 = fields[4]
         if magic != AP_MAGIC or not locked:
+            last_ap_warn_t = warn_if_substrate_down(last_locked_t, last_ap_warn_t)
             continue
+
+        last_locked_t = time.time()
 
         # -- compute G_WAN --
         carrier    = (1.0 - math.cos(theta1)) / 2.0
@@ -188,9 +249,12 @@ def main():
         if step != last_step:
             set_rate(rate_mbit)
             last_step = step
+            ns_age = time.time() - last_valid_ns_t
             print(f"[ns_wan_gain] θ={theta1:.3f} carrier={carrier:.3f} "
                   f"e_C={e_C_ema:+.5f} temlum={temlum_ema:+.3f} "
-                  f"G={G_WAN:.3f} → {rate_mbit}Mbit", flush=True)
+                  f"G={G_WAN:.3f} → {rate_mbit}Mbit  "
+                  f"ns[ok={ns_accepted} rej={ns_rejected} "
+                  f"{'STALE ' if ns_stale else ''}age={ns_age:.0f}s]", flush=True)
 
 
 if __name__ == "__main__":
