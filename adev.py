@@ -143,8 +143,10 @@ def load_chain(path):
     rows = []
     for line in open(path):
         line = line.strip()
-        if line.startswith("{"):
-            r = json.loads(line)
+        if not line.startswith("{"):
+            continue
+        r = json.loads(line)
+        if "tick" in r:   # skip non-tick marker lines, e.g. {"event": "START", ...}
             rows.append(r)
     rows.sort(key=lambda r: r["tick"])
     return rows
@@ -187,8 +189,8 @@ if __name__ == "__main__":
         idx = sys.argv.index("--chain")
         rows = load_chain(sys.argv[idx+1])
         pd_series    = [r["pd"] for r in rows]
-        phase_label  = "theta1"
-        phase_series = [r.get("theta1", 0) for r in rows]
+        phase_label  = "theta"
+        phase_series = [r.get("theta", 0) for r in rows]
         tick_diffs   = [rows[i+1]["tick"] - rows[i]["tick"] for i in range(len(rows)-1)]
         tau0 = (sum(tick_diffs)/len(tick_diffs)) * TICK_S if tick_diffs else TICK_S * 100
         label = sys.argv[idx+1]
