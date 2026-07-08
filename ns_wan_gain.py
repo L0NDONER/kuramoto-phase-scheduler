@@ -5,20 +5,22 @@ ns_wan_gain.py — Mint WAN egress, Nazaré-coupled continuous shaper.
 The WAN rate is a modulated derivative of the Nazaré carrier — not a
 standalone oscillator.  On every locked AxisPulse tick:
 
-  WAN_rate(t) = BaseWAN × G(theta, margin, temlum, e_C)
+  WAN_rate(t) = BaseWAN × G(theta, temlum, e_C)
 
-  G = thermal(temlum) × [G_BASE + (1−G_BASE) × mod_depth(margin) × carrier(theta)]
+  G = thermal(temlum) × [G_BASE + (1−G_BASE) × mod_depth(e_C) × carrier(theta)]
     + ec_bias(e_C)
 
   carrier(theta) = (1 − cos θ₁) / 2          — trough=0 at θ=0, peak=1 at θ=π
-  mod_depth      = clamp(margin / MARGIN_SCALE, 0, 1)  — nazaré population gain
+  mod_depth      = clamp(max(0, e_C) / EC_MOD_SCALE, 0, 1)  — e_C-driven gain depth
   thermal        = 1 − clamp(max(0, temlum) / HEADROOM, 0, 1−G_MIN)  — Pi2 headroom
   ec_bias        = clamp(e_C / EC_SCALE × 0.15, −0.15, +0.15)
+
+  e_C drives both mod_depth and ec_bias — there is no separate CortexPulse
+  "margin" input; that pathway was never wired up on this host.
 
 Inputs (non-blocking; latest value used on each AP tick):
   239.0.0.2:7404  AxisPulse multicast    — theta1, locked   (pacing clock)
   239.0.0.3:7440  NucleusState multicast — temlum, e_C       (Pi2 thermal state)
-  127.0.0.1:7411  CortexPulse loopback   — X, Y, margin      (nazaré gain field)
 
 Output: tc HTB rate on IFACE 1:10, range RATE_MIN–RATE_MAX Mbit, N_STEPS quantised.
 Manages its own qdisc; tears it down on SIGINT/SIGTERM.
@@ -59,8 +61,6 @@ AP_WARN_S         = 60.0     # no locked AxisPulse tick this long → log loudly
 # Wire formats
 AP_MAGIC  = 0x4158;  AP_FMT  = "!HBBIfffffHQ"   # AxisPulse 38 bytes
 NS_MAGIC  = 0x4E53;  NS_FMT  = "!HfffBB"         # NucleusState 16 bytes
-
-CP_MAGIC  = 0x4358;  CP_FMT  = "!HffIf"          # CortexPulse 18 bytes
 
 AP_PORT = 7404;  AP_GRP = "239.0.0.2"
 NS_PORT = 7440;  NS_GRP = "239.0.0.3"
