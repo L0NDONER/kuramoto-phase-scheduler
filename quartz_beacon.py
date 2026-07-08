@@ -159,11 +159,10 @@ def main():
 
         theta_self = (omega * (now - t0)) % (2 * math.pi)
 
-        t0_ns_raw = int(t0 * 1e9) if tick % ANCHOR_EVERY == 0 else 0
-        raw_out.sendto(struct.pack(RAW_FMT, RAW_MAGIC, sid, tick, theta_self, omega, 0, t0_ns_raw),
+        t0_ns = int(t0 * 1e9) if tick % ANCHOR_EVERY == 0 else 0
+        raw_out.sendto(struct.pack(RAW_FMT, RAW_MAGIC, sid, tick, theta_self, omega, 0, t0_ns),
                         (RAW_GRP, RAW_PORT))
 
-        t0_ns = int(t0 * 1e9) if tick % ANCHOR_EVERY == 0 else 0
         live = {psid: p for psid, p in peers.items() if (now - p["t"]) < PEER_STALE_S}
 
         if live:

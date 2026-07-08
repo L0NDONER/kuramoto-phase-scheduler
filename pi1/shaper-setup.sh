@@ -63,8 +63,13 @@ iptables -t mangle -C FORWARD -s 52.84.0.0/15    -j MARK --set-mark 10 2>/dev/nu
 
 # YouTube/Google — mark 10 (928 ranges via cdn-ip-database, loaded into ipset)
 /usr/sbin/ipset create google_cdn_new hash:net family inet hashsize 4096 maxelem 65536 2>/dev/null || true
-/usr/sbin/ipset flush google_cdn_new
-tail -n +2 /etc/shaper/google_cdn.ipset | sed 's/google_cdn /google_cdn_new /' | /usr/sbin/ipset restore -exist
+# Both steps below are best-effort: this whole script runs under `set -e`,
+# and everything after it (QUIC gate, wave-pacer, CONNMARK, all tc HTB
+# classes) has nothing to do with the Google CDN list — a missing/stale
+# /etc/shaper/google_cdn.ipset must not be able to abort the rest of setup.
+/usr/sbin/ipset flush google_cdn_new || echo "WARNING: ipset flush google_cdn_new failed, continuing" >&2
+tail -n +2 /etc/shaper/google_cdn.ipset | sed 's/google_cdn /google_cdn_new /' | /usr/sbin/ipset restore -exist || \
+    echo "WARNING: google_cdn ipset restore failed (missing/malformed /etc/shaper/google_cdn.ipset?), continuing without refreshed list" >&2
 /usr/sbin/ipset create google_cdn hash:net family inet hashsize 4096 maxelem 65536 2>/dev/null || true
 /usr/sbin/ipset swap google_cdn google_cdn_new 2>/dev/null || true
 /usr/sbin/ipset destroy google_cdn_new 2>/dev/null || true

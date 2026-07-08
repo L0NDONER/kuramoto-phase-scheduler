@@ -4,7 +4,7 @@ wave-pacer.py — NFQUEUE pacer with DRR fairness, sine envelope from Pi1 quartz
 
 iptables setup (already in shaper-setup.sh):
   iptables -t mangle -A POSTROUTING -o eth0 -j NFQUEUE --queue-num 10 --queue-maxlen 1024
-  Mark packets by service: 40=iplayer 35=itvx 20=nowtv 10=youtube
+  Mark packets by service: 40=iplayer 35=itvx 20=sky 10=youtube
 """
 
 import math
@@ -18,6 +18,9 @@ from netfilterqueue import NetfilterQueue
 QUEUE_NUM      = 10
 BASE_RATE_BPS  = 20_000_000   # 20 Mbps envelope
 TICK_HZ        = 100           # 10 ms ticks; cooperates with scheduler
+MAX_QUEUE_PKTS = 200            # per-flow software queue cap — bounds latency/memory
+                                 # under sustained overload instead of growing unbounded
+TOKEN_BURST_S  = 0.05           # per-flow rate_bps enforced via token bucket, 50ms burst allowance
 
 # Sine period derived from Pi1 adjtimex freq_ppm = -14.143646
 # abs(ppm) → seconds: this crystal's own deviation signature
@@ -27,7 +30,7 @@ PERIOD_S       = 14.143646    # quartz-derived; do not hand-tune
 MARK_FLOW = {
     40: "iplayer",
     35: "itvx",
-    20: "nowtv",
+    20: "sky",     # shaper-setup.sh marks this "Sky Go — mark 20"; there is no NOW TV rule
     10: "youtube",
 }
 DEFAULT_FLOW = "default"
@@ -36,7 +39,7 @@ DEFAULT_FLOW = "default"
 FLOW_CFG = {
     "iplayer": {"rate_bps":  4_500_000, "quantum":  4_500},
     "itvx":    {"rate_bps":  7_000_000, "quantum":  7_000},
-    "nowtv":   {"rate_bps":  4_200_000, "quantum":  4_200},
+    "sky":     {"rate_bps":  4_200_000, "quantum":  4_200},
     "youtube": {"rate_bps": 14_000_000, "quantum": 14_000},
     "default": {"rate_bps": BASE_RATE_BPS, "quantum": 1_500},
 }
@@ -50,6 +53,10 @@ class Flow:
     queue: deque = field(default_factory=deque)   # items: (pkt_handle, payload_bytes)
     deficit: int = 0
     bytes_sent: int = 0
+    dropped: int = 0     # packets tail-dropped because queue was at MAX_QUEUE_PKTS
+    tokens: float = 0.0  # rate_bps token bucket — enforces the per-flow ceiling
+                          # independently of DRR quantum, which only governs
+                          # fairness when multiple flows are contending
 
 
 class WavePacer:
@@ -68,10 +75,17 @@ class WavePacer:
 
     def _callback(self, pkt):
         flow_name = MARK_FLOW.get(pkt.get_mark(), DEFAULT_FLOW)
-        pkt.retain()                        # keep handle alive across threads
-        payload = pkt.get_payload()
         with self._lock:
-            self.flows[flow_name].queue.append((pkt, payload))
+            flow = self.flows[flow_name]
+            if len(flow.queue) >= MAX_QUEUE_PKTS:
+                # Tail-drop: bounds latency/memory under sustained overload
+                # instead of the software queue growing without limit.
+                flow.dropped += 1
+                pkt.drop()
+                return
+            pkt.retain()                    # keep handle alive across threads
+            payload = pkt.get_payload()
+            flow.queue.append((pkt, payload))
 
     # ------------------------------------------------------------------
     # Drain loop — runs in dedicated thread at TICK_HZ
@@ -81,6 +95,7 @@ class WavePacer:
         self.running = True
         tick_interval = 1.0 / TICK_HZ
         last_tick = time.monotonic()
+        next_status_at = last_tick + 1.0
 
         while self.running:
             now = time.monotonic()
@@ -95,6 +110,14 @@ class WavePacer:
                 envelope = 0.8 + 0.2 * math.sin(2 * math.pi * now / PERIOD_S)
                 budget   = int((BASE_RATE_BPS * envelope / 8) * dt)
 
+                # Refill each flow's rate_bps token bucket. This enforces
+                # rate_bps as a real per-flow ceiling — DRR quantum below
+                # only governs fairness *among contending flows*, it doesn't
+                # cap a single flow that has the queue to itself.
+                for flow in self.flows.values():
+                    cap = flow.rate_bps / 8 * TOKEN_BURST_S
+                    flow.tokens = min(cap, flow.tokens + flow.rate_bps / 8 * dt)
+
                 # Deficit Round Robin across flows
                 while budget > 0:
                     sent_this_round = False
@@ -108,18 +131,30 @@ class WavePacer:
                             sz = len(payload)
                             if flow.deficit < sz:
                                 break           # DRR: wait until deficit covers packet
+                            if flow.tokens < sz:
+                                break           # rate_bps ceiling: flow is out of tokens
                             if budget <= 0:
                                 break
                             flow.queue.popleft()
                             pkt_obj.accept()
                             flow.deficit -= sz
+                            flow.tokens -= sz
                             flow.bytes_sent += sz
                             budget -= sz
                             sent_this_round = True
                         if budget <= 0:
                             break
                     if not sent_this_round:
-                        break                   # all queues empty or deficit too low
+                        break                   # all queues empty, deficit too low, or out of tokens
+
+                if now >= next_status_at:
+                    next_status_at = now + 1.0
+                    depth = {n: len(f.queue) for n, f in self.flows.items() if f.queue}
+                    drops = {n: f.dropped for n, f in self.flows.items() if f.dropped}
+                    print(f"[wave-pacer] q_bytes={self._q_bytes()} depth={depth or '{}'} "
+                          f"drops={drops or '{}'} "
+                          f"sent={ {n: f.bytes_sent for n, f in self.flows.items()} }",
+                          flush=True)
 
     def _q_bytes(self) -> int:
         return sum(sum(len(p) for _, p in f.queue) for f in self.flows.values())
