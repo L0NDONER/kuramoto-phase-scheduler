@@ -47,6 +47,18 @@ NC_END_FMT = ">HB"
 NC_HEARTBEAT_FMT = ">HBQ"  # magic,type,ap_tick — no bit index, just "I saw this tick"
 
 
+def next_ap_tick(sel, ap_in, sid, timeout=1.0):
+    for key, _ in sel.select(timeout=timeout):
+        data, _ = ap_in.recvfrom(64)
+        if len(data) < struct.calcsize(AP_FMT):
+            continue
+        f = struct.unpack_from(AP_FMT, data)
+        if f[0] != AP_MAGIC or f[1] != sid:
+            continue
+        return f[3]
+    return None
+
+
 def mcast_in(grp, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -93,14 +105,7 @@ def main():
     latest_tick = None
     t_wait = time.monotonic() + 10.0
     while latest_tick is None and time.monotonic() < t_wait:
-        for key, _ in sel.select(timeout=1.0):
-            data, _ = ap_in.recvfrom(64)
-            if len(data) < struct.calcsize(AP_FMT):
-                continue
-            f = struct.unpack_from(AP_FMT, data)
-            if f[0] != AP_MAGIC or f[1] != args.sid:
-                continue
-            latest_tick = f[3]
+        latest_tick = next_ap_tick(sel, ap_in, args.sid)
 
     if latest_tick is None:
         sys.exit("[nazare-carrier] no live AxisPulse observed — is quartz_beacon.py running for this sid?")
@@ -121,23 +126,19 @@ def main():
         # the whole point: we cannot know "now" is the right beat without a
         # live feed telling us so, unlike a sleep-loop's self-computed grid.
         while latest_tick < target_tick:
-            for key, _ in sel.select(timeout=1.0):
-                data, _ = ap_in.recvfrom(64)
-                if len(data) < struct.calcsize(AP_FMT):
-                    continue
-                f = struct.unpack_from(AP_FMT, data)
-                if f[0] != AP_MAGIC or f[1] != args.sid:
-                    continue
-                latest_tick = f[3]
+            t = next_ap_tick(sel, ap_in, args.sid)
+            if t is None:
+                continue
+            latest_tick = t
 
-                # inner phase: fire a heartbeat every hb_ticks, independent of
-                # (much faster than) the outer semantic beat — proves live
-                # carrier access continuously, not just once per bit
-                if args.hb_ticks and latest_tick - last_hb_tick >= args.hb_ticks:
-                    out.sendto(struct.pack(NC_HEARTBEAT_FMT, NC_MAGIC, NC_HEARTBEAT, latest_tick),
-                               (args.dest, NC_PORT))
-                    last_hb_tick = latest_tick
-                    n_hb += 1
+            # inner phase: fire a heartbeat every hb_ticks, independent of
+            # (much faster than) the outer semantic beat — proves live
+            # carrier access continuously, not just once per bit
+            if args.hb_ticks and latest_tick - last_hb_tick >= args.hb_ticks:
+                out.sendto(struct.pack(NC_HEARTBEAT_FMT, NC_MAGIC, NC_HEARTBEAT, latest_tick),
+                           (args.dest, NC_PORT))
+                last_hb_tick = latest_tick
+                n_hb += 1
 
         if b:
             out.sendto(struct.pack(NC_PULSE_FMT, NC_MAGIC, NC_PULSE, i), (args.dest, NC_PORT))
