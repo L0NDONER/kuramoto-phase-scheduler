@@ -19,7 +19,7 @@ Output:
 
 Consumers obey RefleState; they do no health assessment of their own.
 """
-import socket, struct, selectors, time
+import math, socket, struct, selectors, time
 
 CALM=0; ALERT=1; WITHDRAW=2; PARK=3; RECOVER=4
 _NAME = ["CALM","ALERT","WITHDRAW","PARK","RECOVER"]
@@ -81,6 +81,13 @@ sid_last_t  = {}   # sid -> last packet time
 SID_STALE_S = 3.0
 
 
+def surprise_bits(p):
+    """Self-information of a fraction: bits = -log2(p)."""
+    if p <= 0.0:
+        return float("inf")
+    return -math.log2(p)
+
+
 def emit():
     try:
         rs_out.sendto(struct.pack(RS_FMT, RS_MAGIC, state, pd_dev, temlum), rs_addr)
@@ -92,8 +99,14 @@ def go(new):
     global state, alert_clear_since, recover_since
     if new == state:
         return
-    votes = {sid: round(ema, 4) for sid, ema in sid_pd_ema.items()}
-    print(f"[reflex] {_NAME[state]} → {_NAME[new]}  votes={votes}", flush=True)
+    now  = time.time()
+    live = [sid for sid, t in sid_last_t.items() if (now - t) < SID_STALE_S]
+    votes    = {sid: round(sid_pd_ema[sid], 4) for sid in live}
+    worst_pd = max((sid_pd_ema[sid] for sid in live), default=0.0)
+    n_noisy  = sum(1 for sid in live if sid_pd_ema[sid] > ALERT_PD)
+    p_vote   = n_noisy / len(live) if live else 1.0
+    print(f"[reflex] {_NAME[state]} → {_NAME[new]}  votes={votes} "
+          f"bits_vote={surprise_bits(p_vote):.3f} pd_ratio={worst_pd/ALERT_PD:.3f}", flush=True)
     state = new
     alert_clear_since = recover_since = None
 
@@ -140,11 +153,7 @@ while True:
     if state == CALM:
         if hot:                               go(PARK)
         elif withdrawal or ragged or stale:   go(WITHDRAW)
-        elif warm or noisy:
-            votes = {sid: round(sid_pd_ema[sid], 4) for sid in live_sids}
-            print(f"[reflex] trigger warm={warm}(temlum={temlum_ema:.3f}) "
-                  f"noisy={noisy} ({n_noisy}/{len(live_sids)} sids, quorum={quorum}) {votes}", flush=True)
-            go(ALERT)
+        elif warm or noisy:                   go(ALERT)
 
     elif state == ALERT:
         if hot:                               go(PARK)
