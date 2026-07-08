@@ -16,8 +16,8 @@ Usage:
 """
 import ctypes, hashlib, math, socket, struct, sys, time
 
-AP_GRP  = "239.0.0.2"; AP_PORT = 7404
-AP_FMT  = ">HBBIfffffHQ"; AP_SIZE = struct.calcsize(AP_FMT); AP_MAGIC = 0x4158
+from axis_pulse import AP_GRP, AP_PORT, AP_FMT, AP_MAGIC, hash_to_bits
+AP_SIZE = struct.calcsize(AP_FMT)
 
 PS_GRP  = "239.0.0.7"; PS_PORT = 7470
 PS_MAGIC = 0x5053   # "PS"
@@ -96,10 +96,7 @@ def main():
               f"theta2={theta2:.4f} pd={pd:.4f} pd_dev={pd_dev:.5f}")
 
     H = hashlib.sha256(salt_src.encode()).digest()
-    bits = []
-    for byte in H:
-        for i in range(7, -1, -1):
-            bits.append((byte >> i) & 1)
+    bits = hash_to_bits(H)
     n_bits = len(bits)
     print(f"[send] hash={H.hex()}  ({n_bits} bits to pulse-code)")
 

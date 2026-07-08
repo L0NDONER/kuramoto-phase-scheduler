@@ -23,6 +23,8 @@ import socket
 import struct
 import time
 
+from axis_pulse import hash_to_bits
+
 PS_MAGIC = 0x5053
 PS_START, PS_PULSE, PS_END = 1, 2, 3
 PS_START_FMT = ">HBHI"
@@ -47,10 +49,7 @@ def main():
     tick_us = int(tick_s * 1e6)
 
     H = hashlib.sha256(args.salt.encode()).digest()
-    bits = []
-    for byte in H:
-        for i in range(7, -1, -1):
-            bits.append((byte >> i) & 1)
+    bits = hash_to_bits(H)
     n_bits = len(bits)
 
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

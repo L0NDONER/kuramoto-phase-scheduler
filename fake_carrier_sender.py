@@ -18,10 +18,7 @@ import struct
 import sys
 import time
 
-AP_GRP, AP_PORT = "239.0.0.2", 7404
-AP_FMT = ">HBBIfffffHQ"
-AP_MAGIC = 0x4158
-AP_TICK_S = 0.01
+from axis_pulse import AP_GRP, AP_PORT, AP_TICK_S, mcast_in, next_ap_tick, hash_to_bits
 
 NC_MAGIC = 0x4E43
 NC_START, NC_PULSE, NC_END, NC_HEARTBEAT = 1, 2, 3, 4
@@ -29,17 +26,6 @@ NC_START_FMT = ">HBHHQ"
 NC_PULSE_FMT = ">HBH"
 NC_HEARTBEAT_FMT = ">HBQ"
 NC_PORT = 7480
-
-
-def mcast_in(grp, port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("", port))
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                 socket.inet_aton(grp) + socket.inet_aton("0.0.0.0"))
-    s.setblocking(False)
-    return s
 
 
 def main():
@@ -54,10 +40,7 @@ def main():
     args = ap.parse_args()
 
     H = hashlib.sha256(args.salt.encode()).digest()
-    bits = []
-    for byte in H:
-        for i in range(7, -1, -1):
-            bits.append((byte >> i) & 1)
+    bits = hash_to_bits(H)
     n_bits = len(bits)
 
     # one-time snapshot only — this is the "leaked one packet" scenario
@@ -67,14 +50,7 @@ def main():
     latest_tick = None
     t_wait = time.monotonic() + 10.0
     while latest_tick is None and time.monotonic() < t_wait:
-        for key, _ in sel.select(timeout=1.0):
-            data, _ = ap_in.recvfrom(64)
-            if len(data) < struct.calcsize(AP_FMT):
-                continue
-            f = struct.unpack_from(AP_FMT, data)
-            if f[0] != AP_MAGIC or f[1] != args.sid:
-                continue
-            latest_tick = f[3]
+        latest_tick = next_ap_tick(sel, ap_in, args.sid)
     if latest_tick is None:
         sys.exit("[fake-carrier] couldn't even get the one snapshot")
     ap_in.close()  # go dark — no further live access from here on

@@ -33,10 +33,7 @@ import struct
 import sys
 import time
 
-AP_GRP, AP_PORT = "239.0.0.2", 7404
-AP_FMT = ">HBBIfffffHQ"
-AP_MAGIC = 0x4158
-AP_TICK_S = 0.01   # quartz_beacon.py TICK_S — fixed cadence of the carrier
+from axis_pulse import AP_GRP, AP_PORT, AP_TICK_S, mcast_in, next_ap_tick, hash_to_bits
 
 NC_GRP, NC_PORT = "239.0.0.9", 7480
 NC_MAGIC = 0x4E43  # "NC"
@@ -45,29 +42,6 @@ NC_START_FMT = ">HBHHQ"   # magic,type,n_bits,beat_ticks,start_ap_tick
 NC_PULSE_FMT = ">HBH"     # magic,type,idx
 NC_END_FMT = ">HB"
 NC_HEARTBEAT_FMT = ">HBQ"  # magic,type,ap_tick — no bit index, just "I saw this tick"
-
-
-def next_ap_tick(sel, ap_in, sid, timeout=1.0):
-    for key, _ in sel.select(timeout=timeout):
-        data, _ = ap_in.recvfrom(64)
-        if len(data) < struct.calcsize(AP_FMT):
-            continue
-        f = struct.unpack_from(AP_FMT, data)
-        if f[0] != AP_MAGIC or f[1] != sid:
-            continue
-        return f[3]
-    return None
-
-
-def mcast_in(grp, port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("", port))
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                 socket.inet_aton(grp) + socket.inet_aton("0.0.0.0"))
-    s.setblocking(False)
-    return s
 
 
 def main():
@@ -86,10 +60,7 @@ def main():
     args = ap.parse_args()
 
     H = hashlib.sha256(args.salt.encode()).digest()
-    bits = []
-    for byte in H:
-        for i in range(7, -1, -1):
-            bits.append((byte >> i) & 1)
+    bits = hash_to_bits(H)
     n_bits = len(bits)
 
     ap_in = mcast_in(AP_GRP, args.ap_port)
