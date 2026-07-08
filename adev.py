@@ -15,8 +15,8 @@ Output: ADEV(τ) table + noise-type identification + gap threshold.
 """
 import socket, struct, time, math, sys, json, csv as _csv
 
-AP_GRP  = "239.0.0.2"; AP_PORT = 7404
-AP_FMT  = ">HBBIfffffHQ"; AP_SIZE = struct.calcsize(AP_FMT); AP_MAGIC = 0x4158
+from axis_pulse import AP_GRP, AP_PORT, AP_FMT, AP_MAGIC
+AP_SIZE = struct.calcsize(AP_FMT)
 
 TICK_S  = 0.010   # quartz_beacon.py tick period — one tick = one crystal step
 
@@ -75,6 +75,17 @@ def noise_type(adev_results):
         else:               label = "DRIFT"
         types.append((tau_b, slope, label))
     return types
+
+def print_adev_table(series, tau0):
+    """ADEV(tau) table with noise-type classification, printed and returned."""
+    results = adev(series, tau0)
+    nt_map = {t: (s, l) for t, s, l in noise_type(results)}
+    print(f"{'tau_s':>10}  {'tau_ticks':>10}  {'ADEV':>12}  {'n_pairs':>8}  noise")
+    for tau_s, ad, n in results:
+        nm = nt_map.get(tau_s, (0, ""))[1]
+        print(f"{tau_s:>10.3f}  {tau_s/TICK_S:>10.1f}  {ad:>12.6f}  {n:>8}  {nm}")
+    return results
+
 
 def gap_threshold(adev_results):
     """
@@ -149,7 +160,7 @@ def unwrap(phases):
     return out
 
 if __name__ == "__main__":
-    rows = None; tau0 = TICK_S; label = ""
+    phase_series = None; phase_label = None
 
     if "--live" in sys.argv:
         idx = sys.argv.index("--live")
@@ -158,35 +169,36 @@ if __name__ == "__main__":
         if "--sid" in sys.argv:
             sid = int(sys.argv[sys.argv.index("--sid")+1])
         rows = collect_live(dur, sid=sid)
-        pd_series   = [r["pd"] for r in rows]
+        pd_series = [r["pd"] for r in rows]
         # own theta is fresh every packet at this sid; peer's theta in this
         # packet is a stale copy — only the own series is valid for ADEV.
-        own_key = "theta1" if sid == 1 else "theta2"
-        th1_series  = unwrap([r[own_key] for r in rows])
+        phase_label = "theta1" if sid == 1 else "theta2"
+        phase_series = unwrap([r[phase_label] for r in rows])
         tau0 = TICK_S; label = f"live AxisPulse (sid={sid})"
 
     elif "--csv" in sys.argv:
         idx = sys.argv.index("--csv")
         rows = load_csv(sys.argv[idx+1])
-        pd_series  = [r["pd"] for r in rows]
+        pd_series = [r["pd"] for r in rows]
         tau0 = TICK_S * 2   # baseline CSV sampled at AP rate (2× beacon ticks)
         label = sys.argv[idx+1]
 
     elif "--chain" in sys.argv:
         idx = sys.argv.index("--chain")
         rows = load_chain(sys.argv[idx+1])
-        pd_series   = [r["pd"] for r in rows]
-        th1_series  = [r.get("theta1", 0) for r in rows]
-        tick_diffs  = [rows[i+1]["tick"] - rows[i]["tick"] for i in range(len(rows)-1)]
+        pd_series    = [r["pd"] for r in rows]
+        phase_label  = "theta1"
+        phase_series = [r.get("theta1", 0) for r in rows]
+        tick_diffs   = [rows[i+1]["tick"] - rows[i]["tick"] for i in range(len(rows)-1)]
         tau0 = (sum(tick_diffs)/len(tick_diffs)) * TICK_S if tick_diffs else TICK_S * 100
         label = sys.argv[idx+1]
 
     else:
         # default: live 120s
         rows = collect_live(120.0)
-        pd_series  = [r["pd"] for r in rows]
-        th1_series = unwrap([r["theta1"] for r in rows])
-        th2_series = unwrap([r["theta2"] for r in rows])
+        pd_series    = [r["pd"] for r in rows]
+        phase_label  = "theta1"
+        phase_series = unwrap([r["theta1"] for r in rows])
         tau0 = TICK_S; label = "live 120s"
 
     print(f"\n=== Allan Deviation — {label} ===")
@@ -194,14 +206,7 @@ if __name__ == "__main__":
 
     # ── phase difference (pd) ADEV ────────────────────────────────────────────
     print(f"\n--- pd (phase difference, anti-phase deviation) ---")
-    print(f"{'tau_s':>10}  {'tau_ticks':>10}  {'ADEV':>12}  {'n_pairs':>8}  noise")
-    ad_pd = adev(pd_series, tau0)
-    nt    = noise_type(ad_pd)
-    nt_map = {t: (s, l) for t, s, l in nt}
-    for tau_s, ad, n in ad_pd:
-        ticks = tau_s / TICK_S
-        nm = nt_map.get(tau_s, (0, ""))[1]
-        print(f"{tau_s:>10.3f}  {ticks:>10.1f}  {ad:>12.6f}  {n:>8}  {nm}")
+    ad_pd = print_adev_table(pd_series, tau0)
 
     gap_t = gap_threshold(ad_pd)
     if gap_t:
@@ -209,25 +214,16 @@ if __name__ == "__main__":
         print(f"\n  Flicker floor: ADEV={g_ad:.6f} at τ={g_tau:.3f}s ({g_tau/TICK_S:.0f} ticks)")
         print(f"  Gap threshold: gaps > {g_tau:.1f}s ({g_tau/TICK_S:.0f} ticks) produce detectable phase drift")
 
-    # ── absolute phase ADEV (theta1) if available ─────────────────────────────
-    if "th1_series" in dir() and th1_series:
-        own_label = own_key if "own_key" in dir() else "theta1"
-        print(f"\n--- {own_label} (absolute phase, detrended) ---")
+    # ── absolute phase ADEV, if this data source has one ──────────────────────
+    if phase_series:
+        print(f"\n--- {phase_label} (absolute phase, detrended) ---")
         # detrend: remove linear fit
-        n = len(th1_series)
+        n = len(phase_series)
         t_arr = list(range(n))
-        mt = (n-1)/2; mx = sum(th1_series)/n
-        num = sum((t_arr[i]-mt)*(th1_series[i]-mx) for i in range(n))
+        mt = (n-1)/2; mx = sum(phase_series)/n
+        num = sum((t_arr[i]-mt)*(phase_series[i]-mx) for i in range(n))
         den = sum((t_arr[i]-mt)**2 for i in range(n))
         slope = num/den
-        th1_dt = [th1_series[i] - slope*t_arr[i] for i in range(n)]
+        phase_dt = [phase_series[i] - slope*t_arr[i] for i in range(n)]
         print(f"  linear drift = {slope/TICK_S*1e6:.2f} μrad/s")
-
-        print(f"{'tau_s':>10}  {'tau_ticks':>10}  {'ADEV':>12}  {'n_pairs':>8}  noise")
-        ad_th1 = adev(th1_dt, tau0)
-        nt1    = noise_type(ad_th1)
-        nt1_map = {t: (s, l) for t, s, l in nt1}
-        for tau_s, ad, n in ad_th1:
-            ticks = tau_s / TICK_S
-            nm = nt1_map.get(tau_s, (0, ""))[1]
-            print(f"{tau_s:>10.3f}  {ticks:>10.1f}  {ad:>12.6f}  {n:>8}  {nm}")
+        print_adev_table(phase_dt, tau0)
