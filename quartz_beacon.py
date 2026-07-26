@@ -128,16 +128,49 @@ def main():
     while True:
         timeout = max(0.0, next_tick_at - now_raw())
         for key, _ in sel.select(timeout=timeout):
-            data, _ = raw_in.recvfrom(64)
+          # Drain every datagram queued on this socket, not just one.
+          # At 100Hz per sender, two-plus sources push more packets/sec
+          # than this loop's own 100Hz tick cadence can drain one-per-
+          # wakeup — the resulting backlog skews processing order enough
+          # to spuriously trip the origin-pin's PEER_STALE_S check below,
+          # which depends on accurate delivery timing in a way the old
+          # unconditional-overwrite code never did. Origin pinning without
+          # this is worse than no fix at all under real multi-source load
+          # (measured: dev up to 0.94 pinned+starved vs 0.32 unpinned+
+          # starved on the same two-real-source input).
+          while True:
+            try:
+                data, addr = raw_in.recvfrom(64)
+            except BlockingIOError:
+                break
             if len(data) < RAW_SIZE:
                 continue
             f = struct.unpack_from(RAW_FMT, data)
             if f[0] != RAW_MAGIC or f[1] == sid:
                 continue
-            peer = peers.setdefault(f[1], {"pd_prev": None, "pd_ema": 0.0})
+            psid = f[1]
+            src_ip = addr[0]
+            now_seen = now_raw()
+            existing = peers.get(psid)
+            # Pin this sid to whichever source IP is currently live for it.
+            # A second source claiming the same sid while the bound source
+            # is still fresh (within PEER_STALE_S) is rejected outright,
+            # not blended — two sources racing for one slot is exactly the
+            # 2026-07-09 corruption (peer1 alternating identity, dev
+            # spiking 0.02-0.87 against a ~0.0001 baseline). Once the bound
+            # source goes stale, a new IP is free to take the slot — this
+            # is the one open assumption: that a legitimate source change
+            # (DHCP renewal, node restart) always follows a full
+            # PEER_STALE_S silence rather than overlapping the old source.
+            if (existing is not None and existing.get("addr") is not None
+                    and src_ip != existing["addr"]
+                    and (now_seen - existing["t"]) < PEER_STALE_S):
+                continue
+            peer = peers.setdefault(psid, {"pd_prev": None, "pd_ema": 0.0, "addr": None})
             peer["theta"] = f[3]
             peer["omega"] = f[4]
-            peer["t"] = now_raw()
+            peer["t"] = now_seen
+            peer["addr"] = src_ip
 
         now = now_raw()
         if now < next_tick_at:
