@@ -1,3 +1,8 @@
+#################################################################################
+#                                                                               #
+#             IF YOU ARE NOT MARTIN OR UBUNTU, KINDLY DISAPPEAR L0NDONER.       #
+#                                                                               #
+#################################################################################
 #!/usr/bin/env python3
 import pathlib
 import re
@@ -126,9 +131,11 @@ def read_queue_backlog() -> int:
     return 0
 
 
-def read_decode_latency() -> float:
+def read_decode_drops() -> float:
     with _fs_lock:
-        return _decode_ms
+        if _decode_ts == 0.0 or (time.monotonic() - _decode_ts) > DECODE_STALE_S:
+            return 0.0   # no recent telemetry -- don't trust a frozen old reading
+        return _decode_drops
 
 
 TC_CLASSID  = "1:10"                    # YouTube / CDN / torrent (uncapped)
@@ -180,12 +187,15 @@ ARMS = {
     # (a ratio and a round-trip time can't go negative), so those two
     # arms could never vote +1/recovery, only 0 or -1.
     "jitter":    Arm(            1.5,         1.2,        1.02,           1.05),
-    "decode":    Arm(            20.0,        18.0,       12.0,           14.0),
+    # DECODE is now a real dropped-frame count (0 when healthy), not ms
+    # latency — enter_recovery/exit_recovery are set unreachable (delta is
+    # clamped >=0 in fs_telemetry.sh) since "0 drops" is neutral-healthy,
+    # not a positive signal to speed up; any drop (>=1) is a real problem.
+    "decode":    Arm(             1.0,         0.0,       -1.0,           -0.5),
     "touch_rtt": Arm(            8.0,         5.0,        1.5,            2.5),
     "mint_load": Arm(            180,         150,        30,             60),
     "link_util": Arm(            90.0,        87.0,       60.0,           65.0),  # %
     "fs_load":   Arm(            75.0,        70.0,       40.0,           45.0),  # % Firestick CPU
-    "fs_rssi":   Arm(            80.0,        75.0,       65.0,           70.0),  # -dBm (negated)
     "fs_jitter": Arm(             5.0,         3.0,        0.0,            2.0),  # ms tick jitter
 }
 
@@ -227,14 +237,16 @@ threading.Thread(target=_touch_loop, daemon=True, name="pi_touch").start()
 # ---------- Firestick telemetry listener ----------
 
 FS_TELEM_PORT = 5057
+DECODE_STALE_S = 3.0   # telemetry restarts every 5-10s; older than this is not "live"
 _fs_load:     float | None = None
 _fs_rssi:     float | None = None
 _fs_jitter_ms: float = 0.0   # neutral until first packet
-_decode_ms:   float = 15.0   # neutral until first packet
+_decode_drops: float = 0.0   # frames dropped since last tick; neutral until first packet
+_decode_ts:   float = 0.0    # monotonic time of last DECODE reading; 0 = never received
 _fs_lock = threading.Lock()
 
 def _fs_listener_loop():
-    global _fs_load, _fs_rssi, _fs_jitter_ms, _decode_ms
+    global _fs_load, _fs_rssi, _fs_jitter_ms, _decode_drops, _decode_ts
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", FS_TELEM_PORT))
@@ -247,7 +259,9 @@ def _fs_listener_loop():
             with _fs_lock:
                 if "LOAD"   in kv: _fs_load      = float(kv["LOAD"])
                 if "RSSI"   in kv: _fs_rssi      = float(kv["RSSI"])
-                if "DECODE" in kv: _decode_ms    = float(kv["DECODE"])
+                if "DECODE" in kv:
+                    _decode_drops = float(kv["DECODE"])
+                    _decode_ts    = time.monotonic()
                 if "JITTER" in kv: _fs_jitter_ms = float(kv["JITTER"])
         except Exception:
             pass
@@ -284,7 +298,7 @@ def jitter_arm() -> int:
     return ARMS["jitter"].update(_tick_elapsed)   # normalised below in loop
 
 def decode_arm() -> int:
-    return ARMS["decode"].update(read_decode_latency())
+    return ARMS["decode"].update(read_decode_drops())
 
 def touch_rtt_arm() -> int:
     with _touch_lock:
@@ -303,13 +317,6 @@ def firestick_load_arm() -> int:
     if load is None:
         return 0
     return ARMS["fs_load"].update(load)
-
-def firestick_rssi_arm() -> int:
-    with _fs_lock:
-        rssi = _fs_rssi
-    if rssi is None:
-        return 0
-    return ARMS["fs_rssi"].update(-rssi)  # negate: weaker = higher = panic
 
 def firestick_jitter_arm() -> int:
     with _fs_lock:
@@ -358,7 +365,6 @@ def run_loop(interval=1.0):
             mint_load_arm(),
             link_util_arm(),
             firestick_load_arm(),
-            firestick_rssi_arm(),
             firestick_jitter_arm(),
         ]
 
