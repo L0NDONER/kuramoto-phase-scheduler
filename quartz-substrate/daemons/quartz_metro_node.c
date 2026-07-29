@@ -387,14 +387,24 @@ void send_msg(int sock, const char *ip, int port, const Msg *m) {
     sendto(sock, m, sizeof(*m), 0, (struct sockaddr*)&addr, sizeof(addr));
 }
 
-int recv_until(int sock, MsgType want_type, Msg *out,
+int recv_until(int sock, MsgType want_type, Msg *out, const char *expect_ip,
                 const char *retry_ip, int retry_port, const Msg *probe) {
+    struct in_addr expect_addr;
+    int has_expect = expect_ip && inet_pton(AF_INET, expect_ip, &expect_addr) == 1;
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
         if (probe && attempt > 0) send_msg(sock, retry_ip, retry_port, probe);
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         int n = recvfrom(sock, out, sizeof(*out), 0, (struct sockaddr*)&from, &fl);
-        if (n == (int)sizeof(*out) && out->type == want_type) return 1;
+        if (n == (int)sizeof(*out) && out->type == want_type) {
+            // A packet of the right type from the wrong peer must not satisfy
+            // a slot meant for a different worker (see quartz-substrate fault
+            // test, 2026-07-29: a dead worker's slot was silently filled by
+            // the other worker's reply, freezing that worker's weight with
+            // no error or skip logged).
+            if (has_expect && from.sin_addr.s_addr != expect_addr.s_addr) continue;
+            return 1;
+        }
     }
     return 0;
 }
@@ -420,21 +430,21 @@ int run_worker(JobSpec *j, int slot, const char *coord_ip) {
         // forward across rounds — only restart==0 waits for MSG_INIT.
         if (restart == 0 || !j->continuous) {
             Msg m;
-            if (!recv_until(sock, MSG_INIT, &m, NULL, 0, NULL)) continue;
+            if (!recv_until(sock, MSG_INIT, &m, coord_ip, NULL, 0, NULL)) continue;
             if (m.id_a != id_a) continue;
             w[0] = m.val_a; if (two) w[1] = m.val_b;
         }
 
         for (int step = 0; step < j->steps_each; step++) {
             Msg m;
-            if (!recv_until(sock, MSG_STEP_REQ, &m, NULL, 0, NULL)) continue;
+            if (!recv_until(sock, MSG_STEP_REQ, &m, coord_ip, NULL, 0, NULL)) continue;
             pending[0] = w[0] + gauss(j->step_sigma);
             if (two) pending[1] = w[1] + gauss(j->step_sigma);
 
             Msg cand = {MSG_CANDIDATE, (uint8_t)id_a, two ? (uint8_t)id_b : 0xFF, pending[0], two ? pending[1] : 0.0, 0};
             Msg decision;
             send_msg(sock, coord_ip, j->coord_port, &cand);
-            if (recv_until(sock, MSG_DECISION, &decision, coord_ip, j->coord_port, &cand)) {
+            if (recv_until(sock, MSG_DECISION, &decision, coord_ip, coord_ip, j->coord_port, &cand)) {
                 if (decision.decision) { w[0] = pending[0]; if (two) w[1] = pending[1]; }
             }
         }
@@ -445,7 +455,7 @@ int run_worker(JobSpec *j, int slot, const char *coord_ip) {
     }
 
     Msg fin;
-    if (!j->continuous && recv_until(sock, MSG_FINAL, &fin, NULL, 0, NULL)) {
+    if (!j->continuous && recv_until(sock, MSG_FINAL, &fin, coord_ip, NULL, 0, NULL)) {
         printf("FINAL slot=%d w%d=%.4f\n", slot, id_a, fin.val_a);
     }
     return 0;
@@ -519,7 +529,7 @@ int run_coordinator(JobSpec *j, const char *worker_ips[2], int max_rounds_overri
             }
             for (int s = 0; s < j->n_workers; s++) {
                 Msg c;
-                if (!recv_until(sock, MSG_CANDIDATE, &c, worker_ips[s], j->worker_port, &req)) { ok = 0; break; }
+                if (!recv_until(sock, MSG_CANDIDATE, &c, worker_ips[s], worker_ips[s], j->worker_port, &req)) { ok = 0; break; }
                 cand[c.id_a] = c.val_a;
                 if (c.id_b != 0xFF) cand[c.id_b] = c.val_b;
             }
