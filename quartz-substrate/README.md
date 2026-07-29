@@ -110,13 +110,37 @@ guessing its IP ranges unsafe).
   two C binaries locally on each (Mint is x86_64, both Pis are aarch64 —
   binaries are never copied cross-arch, only source).
 - **`start.sh`** — starts the substrate + coordinator/workers + both gain
-  daemons in their fixed roles. Gain daemons need root (`tc`).
-- **`stop.sh`** — kills everything `start.sh` started, on all three hosts.
+  daemons in their fixed roles. Gain daemons need root (`tc`). Fixed
+  2026-07-29: used to target `~/quartz-os` and `quartz_metro_node.log`,
+  neither of which matched where production actually runs (`~/claude`,
+  `portfolio_*.log`) — running it as originally written wouldn't have
+  come up as a second copy of production, it would have either silently
+  failed to bind already-held UDP ports or produced confusing duplicates,
+  since it also had no check for already-running processes. Now targets
+  `~/claude` to match. Each remote `ssh` call is wrapped in `timeout 5`
+  (see known quirk below) so one hung call can't block the rest of the
+  script — verified live: ran `stop.sh` against the real job, then this
+  script, and confirmed the resulting processes matched the pre-test
+  baseline exactly on all three hosts.
+- **`stop.sh`** — kills everything `start.sh` started, on all three hosts,
+  by matching each candidate process's `cwd` against `~/claude` (name/argv
+  matching alone can't tell "the instance start.sh started" apart from
+  any other stray copy someone runs from elsewhere). Updated alongside
+  `start.sh`'s path fix, 2026-07-29.
+
+`deploy.sh` still compiles binaries into `~/quartz-os`, not `~/claude` —
+after a `deploy.sh` run, the updated binaries have to be copied into
+`~/claude` by hand (or `stop.sh` + copy + `start.sh`) before `start.sh`
+will actually run the new version. Not unified yet; known, not fixed.
 
 Known quirk: SSH commands that background a detached child on the Pis
 (`... & disown`) reliably hang the *local* ssh client even though the
 remote process detaches fine. Check remote state with a fresh `ssh ... ps`
-call rather than waiting on the hung one.
+call rather than waiting on the hung one. Wrapping the *whole script* in
+an external `timeout` instead of wrapping each `ssh` call is worse, not
+better: `timeout`'s signal goes to the whole process group, which also
+kills the local (non-sudo) daemons the script just backgrounded —
+confirmed live, 2026-07-29.
 
 ## test/
 
