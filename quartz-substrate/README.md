@@ -30,11 +30,14 @@ nothing invented.
   the slot being read, so a dead worker's slot can't be silently filled by
   another worker's reply (fixed 2026-07-29 after a fault-injection test
   showed exactly that happening, freezing the dead worker's weight with no
-  error logged). Known gap, not yet fixed: for continuous jobs (portfolio),
-  `MSG_INIT` is sent by the coordinator exactly once, at its own startup. A
-  worker that restarts mid-job waits forever for an `MSG_INIT` the
-  coordinator will never resend — recovering requires restarting the
-  coordinator too, not just the worker.
+  error logged). For continuous jobs (portfolio), `MSG_INIT` used to be
+  sent by the coordinator exactly once, at its own startup, so a worker
+  restarting mid-job would wait forever for an `MSG_INIT` that never came
+  — recovering required restarting the coordinator too. Fixed 2026-07-29:
+  a restarted worker now probes with `MSG_INIT_REQ`, which the coordinator
+  drains and answers (via `MSG_PEEK`, so it doesn't eat an in-flight
+  `MSG_CANDIDATE`) with that worker's current weight, so it can rejoin
+  without a coordinator restart.
 - **`quartz_job.h`** — the `JobSpec` ABI shared between `quartz_metro_node.c`
   and every job plugin `.so`. Struct layout is the contract; a plugin built
   against a different copy of this header is a mismatch, not just a warning.
