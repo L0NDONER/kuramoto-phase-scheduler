@@ -37,15 +37,23 @@ nothing invented.
   a restarted worker now probes with `MSG_INIT_REQ`, which the coordinator
   drains and answers (via `MSG_PEEK`, so it doesn't eat an in-flight
   `MSG_CANDIDATE`) with that worker's current weight, so it can rejoin
-  without a coordinator restart. The reverse direction needed no fix:
-  killing the coordinator is a non-event for workers — they have no
-  dependency on its liveness and just keep looping on their last known
-  weight until it reappears, at which point the normal step-req/candidate
-  exchange resyncs everything (verified live, 2026-07-29). Also verified
-  with both workers killed at once: coordinator stalls cleanly (flat CPU,
-  no storm, no crash) on both slots, and resumes both via `MSG_INIT_REQ`
-  the moment they're relaunched, with no coordinator restart needed
-  (2026-07-29).
+  without a coordinator restart. Also verified with both workers killed at
+  once: coordinator stalls cleanly (flat CPU, no storm, no crash) on both
+  slots, and resumes both via `MSG_INIT_REQ` the moment they're
+  relaunched, with no coordinator restart needed (2026-07-29).
+  Correction (2026-07-29, caught by `test/fault_test.sh`): an earlier
+  version of this doc claimed killing the coordinator was "a non-event"
+  for workers, based on a manual check that was really just catching
+  in-flight packets still draining right at the kill boundary. Under a
+  controlled check it doesn't hold: a worker's per-step `recv_until` for
+  `MSG_STEP_REQ` has no probe, so once the backlog drains it just times
+  out silently for up to `MAX_RETRIES * RECV_TIMEOUT_MS` (1.6s) *per
+  step*, and `steps_each` (300 for portfolio) never advances meaningfully
+  without a live coordinator. Workers don't crash and do resync cleanly
+  once the coordinator returns, but "non-event" overstated it — it's a
+  near-total stall, not a shrug. Not fixed, since (unlike the worker-side
+  `MSG_INIT_REQ` gap) nothing here corrupts state or needs the coordinator
+  to be manually restarted; flagging it as known, not broken.
 - **`quartz_job.h`** — the `JobSpec` ABI shared between `quartz_metro_node.c`
   and every job plugin `.so`. Struct layout is the contract; a plugin built
   against a different copy of this header is a mismatch, not just a warning.
@@ -109,6 +117,21 @@ Known quirk: SSH commands that background a detached child on the Pis
 (`... & disown`) reliably hang the *local* ssh client even though the
 remote process detaches fine. Check remote state with a fresh `ssh ... ps`
 call rather than waiting on the hung one.
+
+## test/
+
+- **`fault_test.sh`** — automated version of the kill/restart matrix
+  originally run by hand against the live portfolio job on 2026-07-29:
+  kill worker0, kill worker1, kill both workers, kill the coordinator,
+  kill the substrate (`quartz_node`) on pi2 — each asserts the expected
+  recovery, then restores the process it killed. Assumes the portfolio
+  job is already live in its normal `~/claude` locations on all three
+  hosts before running, and leaves it running (recovered) whether it
+  passes or fails. Run it before trusting any change to
+  `quartz_metro_node.c`'s fault paths — a first draft of this script had
+  a real quoting bug (a command stored in a string variable and invoked
+  via bare `$var` doesn't re-parse embedded quotes) that silently made
+  two of the five kills no-ops and produced false failures.
 
 ## What this replaced
 
