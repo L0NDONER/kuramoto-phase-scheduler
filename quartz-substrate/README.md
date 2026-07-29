@@ -41,7 +41,11 @@ nothing invented.
   killing the coordinator is a non-event for workers — they have no
   dependency on its liveness and just keep looping on their last known
   weight until it reappears, at which point the normal step-req/candidate
-  exchange resyncs everything (verified live, 2026-07-29).
+  exchange resyncs everything (verified live, 2026-07-29). Also verified
+  with both workers killed at once: coordinator stalls cleanly (flat CPU,
+  no storm, no crash) on both slots, and resumes both via `MSG_INIT_REQ`
+  the moment they're relaunched, with no coordinator restart needed
+  (2026-07-29).
 - **`quartz_job.h`** — the `JobSpec` ABI shared between `quartz_metro_node.c`
   and every job plugin `.so`. Struct layout is the contract; a plugin built
   against a different copy of this header is a mismatch, not just a warning.
