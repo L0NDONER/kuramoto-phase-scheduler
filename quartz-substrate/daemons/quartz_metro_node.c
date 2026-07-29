@@ -77,7 +77,7 @@
 #define RECV_TIMEOUT_MS 200
 #define MAX_RETRIES 8
 
-typedef enum { MSG_INIT = 1, MSG_STEP_REQ = 2, MSG_CANDIDATE = 3, MSG_DECISION = 4, MSG_FINAL = 5 } MsgType;
+typedef enum { MSG_INIT = 1, MSG_STEP_REQ = 2, MSG_CANDIDATE = 3, MSG_DECISION = 4, MSG_FINAL = 5, MSG_INIT_REQ = 6 } MsgType;
 
 typedef struct {
     uint8_t type;
@@ -430,7 +430,12 @@ int run_worker(JobSpec *j, int slot, const char *coord_ip) {
         // forward across rounds — only restart==0 waits for MSG_INIT.
         if (restart == 0 || !j->continuous) {
             Msg m;
-            if (!recv_until(sock, MSG_INIT, &m, coord_ip, NULL, 0, NULL)) continue;
+            // A restarted worker joining a continuous job mid-flight has no
+            // MSG_INIT coming its way unprompted (the coordinator only ever
+            // sends it once, at its own startup) — probe for it instead of
+            // waiting passively.
+            Msg init_req = {MSG_INIT_REQ, (uint8_t)id_a, two ? (uint8_t)id_b : (uint8_t)0xFF, 0, 0, 0};
+            if (!recv_until(sock, MSG_INIT, &m, coord_ip, coord_ip, j->coord_port, &init_req)) continue;
             if (m.id_a != id_a) continue;
             w[0] = m.val_a; if (two) w[1] = m.val_b;
         }
@@ -459,6 +464,32 @@ int run_worker(JobSpec *j, int slot, const char *coord_ip) {
         printf("FINAL slot=%d w%d=%.4f\n", slot, id_a, fin.val_a);
     }
     return 0;
+}
+
+// Answers any worker's MSG_INIT_REQ with its current weight(s), so a worker
+// that restarts mid-job (continuous jobs only send MSG_INIT once, at coord
+// startup) can rejoin without a full coordinator restart. MSG_PEEK first so
+// a non-INIT_REQ packet (e.g. a MSG_CANDIDATE the step loop is expecting)
+// is left on the socket rather than consumed and lost.
+void serve_init_requests(int sock, JobSpec *j, double *w, const char *worker_ips[2]) {
+    for (;;) {
+        Msg m;
+        struct sockaddr_in from;
+        socklen_t fl = sizeof(from);
+        int n = recvfrom(sock, &m, sizeof(m), MSG_DONTWAIT | MSG_PEEK, (struct sockaddr*)&from, &fl);
+        if (n != (int)sizeof(m) || m.type != MSG_INIT_REQ) return;
+        recvfrom(sock, &m, sizeof(m), MSG_DONTWAIT, (struct sockaddr*)&from, &fl); // actually consume it
+
+        for (int s = 0; s < j->n_workers; s++) {
+            struct in_addr a;
+            inet_pton(AF_INET, worker_ips[s], &a);
+            if (from.sin_addr.s_addr != a.s_addr) continue;
+            int id_a = j->worker_ids[s][0], id_b = j->worker_ids[s][1];
+            int two = (id_b >= 0);
+            Msg init = {MSG_INIT, (uint8_t)id_a, two ? (uint8_t)id_b : 0xFF, w[id_a], two ? w[id_b] : 0.0, 0};
+            send_msg(sock, worker_ips[s], j->worker_port, &init);
+        }
+    }
 }
 
 // ============== COORDINATOR ==============
@@ -518,6 +549,8 @@ int run_coordinator(JobSpec *j, const char *worker_ips[2], int max_rounds_overri
         printf("[job=%s restart=%d] init energy=%.4f\n", j->name, restart, cur_e);
 
         for (int step = 0; step < j->steps_each; step++) {
+            if (j->continuous) serve_init_requests(sock, j, w, worker_ips);
+
             double cand[6];
             memcpy(cand, w, sizeof(double) * j->n_weights);
             for (int i = 0; i < j->n_local; i++) cand[i] = w[i] + gauss(j->step_sigma);
