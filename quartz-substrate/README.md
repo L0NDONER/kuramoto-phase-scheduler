@@ -108,7 +108,18 @@ guessing its IP ranges unsafe).
 
 - **`deploy.sh`** — syncs `daemons/*` to all three hosts and compiles the
   two C binaries locally on each (Mint is x86_64, both Pis are aarch64 —
-  binaries are never copied cross-arch, only source).
+  binaries are never copied cross-arch, only source). Unified 2026-07-29
+  to target `~/claude` (previously `~/quartz-os`, a separate staging copy
+  — see below). Each binary compiles to a `.new` name and `mv`s into place
+  rather than a direct `gcc -o <live path>`, since the live path is very
+  likely the currently-running binary: overwriting a running executable's
+  inode in place hits `ETXTBSY` (confirmed live this session with a plain
+  `cp`), whereas `mv`/rename on the same filesystem just relinks the
+  directory entry — the in-flight process keeps running fine off the
+  now-unlinked old inode. Verified live: ran the full script against the
+  real portfolio job (coordinator + both workers + both substrate daemons
+  all running), and every process kept its original pid and kept
+  progressing through the entire deploy.
 - **`start.sh`** — starts the substrate + coordinator/workers + both gain
   daemons in their fixed roles. Gain daemons need root (`tc`). Fixed
   2026-07-29: used to target `~/quartz-os` and `quartz_metro_node.log`,
@@ -127,11 +138,6 @@ guessing its IP ranges unsafe).
   matching alone can't tell "the instance start.sh started" apart from
   any other stray copy someone runs from elsewhere). Updated alongside
   `start.sh`'s path fix, 2026-07-29.
-
-`deploy.sh` still compiles binaries into `~/quartz-os`, not `~/claude` —
-after a `deploy.sh` run, the updated binaries have to be copied into
-`~/claude` by hand (or `stop.sh` + copy + `start.sh`) before `start.sh`
-will actually run the new version. Not unified yet; known, not fixed.
 
 Known quirk: SSH commands that background a detached child on the Pis
 (`... & disown`) reliably hang the *local* ssh client even though the
