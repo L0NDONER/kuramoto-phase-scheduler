@@ -37,7 +37,11 @@ nothing invented.
   a restarted worker now probes with `MSG_INIT_REQ`, which the coordinator
   drains and answers (via `MSG_PEEK`, so it doesn't eat an in-flight
   `MSG_CANDIDATE`) with that worker's current weight, so it can rejoin
-  without a coordinator restart.
+  without a coordinator restart. The reverse direction needed no fix:
+  killing the coordinator is a non-event for workers — they have no
+  dependency on its liveness and just keep looping on their last known
+  weight until it reappears, at which point the normal step-req/candidate
+  exchange resyncs everything (verified live, 2026-07-29).
 - **`quartz_job.h`** — the `JobSpec` ABI shared between `quartz_metro_node.c`
   and every job plugin `.so`. Struct layout is the contract; a plugin built
   against a different copy of this header is a mismatch, not just a warning.
