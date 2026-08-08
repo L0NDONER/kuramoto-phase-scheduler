@@ -38,7 +38,7 @@ PA_RESP_PORT = 7452
 CHAL_FMT   = "!H16sIH";   CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIH")
 RESP_FMT   = "!H16s32s";  RESP_MAGIC = 0x5052; RESP_SIZE = struct.calcsize("!H16s32s")
 
-CHALLENGE_AHEAD = 30    # ticks ahead to set target_tick (~400ms at 75 tps)
+CHALLENGE_AHEAD = 30    # ticks ahead to set target_tick (~300ms at 100 tps, axis_pulse.AP_TICK_S)
 WINDOW_S        = 3.0   # seconds to wait for prover response after target_tick
 
 
