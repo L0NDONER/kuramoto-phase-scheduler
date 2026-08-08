@@ -89,7 +89,12 @@ Claimed security properties (from the module docstring):
 - **identity** — only a node that observed that `(theta, pd)` at that
   tick can answer.
 - **liveness** — the target-tick window closes in ~300ms
-  (`CHALLENGE_AHEAD = 30` ticks at 100 tps).
+  (`CHALLENGE_AHEAD = 30` ticks at 100 tps). Measured against a live
+  local carrier (2026-08-08, 6 runs): actual challenge-to-observed-tick
+  delay ran 314–329ms, consistently 5–10% over the 300ms nominal
+  figure (`select()`/scheduling overhead, not carrier jitter — the
+  carrier's own `pd_dev` held at ~0.00006 across the same runs). The
+  observed-tick-to-PASS verify leg was tight, 6–9ms.
 - **adjacency** — AxisPulse multicast doesn't route off-LAN, so a
   correct response implies LAN presence.
 - **geometry-member** — `pd` ties the response to a specific oscillator
@@ -124,6 +129,33 @@ if not gate_check():
     ...  # no LAN prover answered correctly in time
 ```
 
+## Fault injection (2026-08-08)
+
+Two live tests run against a real carrier + real prover, both LAN-only,
+no raw sockets:
+
+1. **Off-path race attack — found and fixed.** The challenge nonce is
+   broadcast in cleartext on `239.0.0.5:7451`, so any listener on the
+   LAN can read it without observing anything real. `run_challenge()`
+   used to return `FAIL` on the *first* nonce-matching response,
+   correct or not — an attacker who echoes the nonce back with 32
+   random bytes doesn't have to wait for a future tick like the real
+   prover does, so it reliably won the race and produced a false
+   `FAIL` before the legitimate `PASS` arrived. Reproduced live, then
+   fixed: mismatched digests are now logged as `REJECTED ... (still
+   waiting)` and the challenger keeps listening until either a correct
+   digest arrives or `WINDOW_S` expires. Re-run of the same attack
+   post-fix: `REJECTED` followed by the real prover's `PASS`.
+2. **Off-subnet forgery — held.** A response spoofed from an address
+   outside `PROVER_SUBNET` (10.0.0.0/24) was correctly logged
+   `IGNORED`, and the real prover's response still passed through.
+
+Not yet tested: packet loss/reordering on the AxisPulse multicast
+itself, prover restart mid-window, clock step during a challenge,
+concurrent challenges. Point 2 of [Production
+gaps](#production-gaps) below still stands — this was one fault
+scenario, not a systematic matrix.
+
 ## Wire formats
 
 | Packet | Group:port | Format | Notes |
@@ -143,9 +175,11 @@ ever needs to gate something real, it needs, in order:
    not a standalone auth mechanism. `hash(tick, theta, pd)` is
    unaudited and has no proven cryptographic properties as a bare
    credential.
-2. **Fault injection** — no Jepsen-style partition/reorder testing has
-   been done. The origin-pinning fix above was validated against one
-   real corruption incident, not a systematic fault matrix.
+2. **Fault injection** — one scenario tested and fixed (see [Fault
+   injection](#fault-injection-2026-08-08) above); no systematic
+   Jepsen-style partition/reorder matrix exists yet. The
+   origin-pinning fix in the carrier was validated against one real
+   corruption incident, not a fault matrix either.
 3. **Service discovery** — hosts and sids are hardcoded
    (`SID_BY_HOST = {"pi": 1, "pi2": 2, "mint": 3}`); nothing resembling
    real peer discovery exists.
@@ -162,6 +196,7 @@ ever needs to gate something real, it needs, in order:
 - `phase_auth_prover.py` runs its receive loop at import time (no
   `if __name__ == "__main__"` guard) — importing it (rather than
   running it as a script) blocks immediately.
-- No AxisPulse carrier is running anywhere as of 2026-08-08 (the old
-  beacon deployment was decommissioned 2026-07-29); this package is
-  currently code-only, not a live service.
+- No AxisPulse carrier is deployed anywhere as of 2026-08-08 (the old
+  beacon deployment was decommissioned 2026-07-29); it has only been
+  run ad hoc, locally, for the timing/fault-injection tests above —
+  not a live service.
