@@ -66,7 +66,7 @@ Challenger                                   Prover
 -----------                                  ------
 target_tick = current_tick + 30 (~300ms out)
 nonce = random 16 bytes
---- CHAL: nonce | target_tick | resp_port ---------------> (239.0.0.5:7451)
+--- CHAL: nonce | target_tick | resp_port | sid ----------> (239.0.0.5:7451)
                                               observes AxisPulse at
                                               target_tick -> (theta, pd)
                                               digest = SHA256(nonce
@@ -149,12 +149,28 @@ no raw sockets:
 2. **Off-subnet forgery — held.** A response spoofed from an address
    outside `PROVER_SUBNET` (10.0.0.0/24) was correctly logged
    `IGNORED`, and the real prover's response still passed through.
+3. **Tick-namespace collision across sids — found and fixed
+   (post-fix retest, same day).** `tick` in the AxisPulse packet is a
+   per-node counter — each `quartz_beacon.py` instance starts counting
+   from 0 at its own process start, it is not a shared clock. Neither
+   `phase_auth.py` nor `phase_auth_prover.py` filtered on `sid`, only
+   on `tick`, so with two live nodes broadcasting (required for `pd`
+   to exist at all) a `target_tick` number could match either node's
+   stream. Reproduced live with no attacker present: the prover
+   answered from one sid's buffered packet while the challenger later
+   observed the other sid's packet for the same tick number, producing
+   a legitimate `REJECTED` → `FAIL` with both sides honest. Fixed by
+   adding `sid` to the challenge packet (challenger locks onto a sid
+   during its initial AxisPulse wait and pins the whole exchange to
+   it) and filtering both the live-tick match and the prover's ring
+   buffer on `(sid, tick)` instead of `tick` alone. Retest: 8/8 PASS,
+   alternating cleanly across both live sids.
 
 Not yet tested: packet loss/reordering on the AxisPulse multicast
 itself, prover restart mid-window, clock step during a challenge,
 concurrent challenges. Point 2 of [Production
-gaps](#production-gaps) below still stands — this was one fault
-scenario, not a systematic matrix.
+gaps](#production-gaps) below still stands — three fault scenarios
+found and fixed so far, not a systematic matrix.
 
 ## Wire formats
 
@@ -162,7 +178,7 @@ scenario, not a systematic matrix.
 |---|---|---|---|
 | RAW | `239.0.0.1:7400` | `!HBIffBQ` (24B) | magic, sid, tick, theta, omega, pad, t0_ns |
 | AxisPulse | `239.0.0.2:7404` | `>HBBIfffffHQ` (38B) | magic, sid, locked, tick, theta1, theta2, pd, pd_dev, load_avg, drains, t0_ns |
-| Challenge | `239.0.0.5:7451` | `!H16sIH` | magic, nonce, target_tick, resp_port |
+| Challenge | `239.0.0.5:7451` | `!H16sIHB` | magic, nonce, target_tick, resp_port, sid |
 | Response | unicast, `resp_port` | `!H16s32s` | magic, nonce, sha256 digest |
 
 ## Production gaps

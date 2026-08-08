@@ -17,7 +17,7 @@ AP_FMT   = ">HBBIfffffHQ"; AP_SIZE = struct.calcsize(AP_FMT); AP_MAGIC = 0x4158
 
 PA_GRP       = "239.0.0.5"; PA_CHAL_PORT = 7451
 
-CHAL_FMT   = "!H16sIH";   CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIH")
+CHAL_FMT   = "!H16sIHB";  CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIHB")
 RESP_FMT   = "!H16s32s";  RESP_MAGIC = 0x5052
 
 TICK_BUF = 200
@@ -52,7 +52,7 @@ sel.register(ap_sock,   selectors.EVENT_READ, data="ap")
 sel.register(chal_sock, selectors.EVENT_READ, data="chal")
 
 tick_buf = collections.deque(maxlen=TICK_BUF)
-pending  = {}   # target_tick → (nonce, chal_ip, resp_port, expires)
+pending  = {}   # (sid, target_tick) → (nonce, chal_ip, resp_port, expires)
 
 print(f"[prover] AP:{AP_PORT}  chal:{PA_CHAL_PORT}  buf={TICK_BUF}", flush=True)
 
@@ -67,41 +67,42 @@ while True:
             f = struct.unpack_from(AP_FMT, data)
             if f[0] != AP_MAGIC or not f[2]:
                 continue
-            tick, theta, pd = f[3], f[4], f[6]
-            tick_buf.append((tick, theta, pd))
+            sid, tick, theta, pd = f[1], f[3], f[4], f[6]
+            tick_buf.append((sid, tick, theta, pd))
 
-            if tick in pending:
-                nonce, chal_ip, resp_port, expires = pending.pop(tick)
+            key = (sid, tick)
+            if key in pending:
+                nonce, chal_ip, resp_port, expires = pending.pop(key)
                 if time.time() < expires:
                     digest   = make_hash(nonce, tick, theta, pd)
                     resp_pkt = struct.pack(RESP_FMT, RESP_MAGIC, nonce, digest)
                     resp_out.sendto(resp_pkt, (chal_ip, resp_port))
-                    print(f"[prover] responded  tick={tick}  θ={theta:.4f}  pd={pd:.4f}"
+                    print(f"[prover] responded  sid={sid}  tick={tick}  θ={theta:.4f}  pd={pd:.4f}"
                           f"  → {chal_ip}:{resp_port}", flush=True)
                 else:
-                    print(f"[prover] expired  tick={tick}", flush=True)
+                    print(f"[prover] expired  sid={sid}  tick={tick}", flush=True)
 
         elif tag == "chal":
             data, addr = chal_sock.recvfrom(64)
             if len(data) < CHAL_SIZE:
                 continue
-            magic, nonce, target_tick, resp_port = struct.unpack_from(CHAL_FMT, data)
+            magic, nonce, target_tick, resp_port, req_sid = struct.unpack_from(CHAL_FMT, data)
             if magic != CHAL_MAGIC:
                 continue
             chal_ip = addr[0]
             print(f"[prover] challenge  nonce={nonce.hex()[:12]}…"
-                  f"  target={target_tick}  from={chal_ip}", flush=True)
+                  f"  sid={req_sid}  target={target_tick}  from={chal_ip}", flush=True)
 
-            for t, theta, pd in tick_buf:
-                if t == target_tick:
+            for s, t, theta, pd in tick_buf:
+                if s == req_sid and t == target_tick:
                     digest   = make_hash(nonce, target_tick, theta, pd)
                     resp_pkt = struct.pack(RESP_FMT, RESP_MAGIC, nonce, digest)
                     resp_out.sendto(resp_pkt, (chal_ip, resp_port))
-                    print(f"[prover] responded (buffered)  tick={target_tick}"
+                    print(f"[prover] responded (buffered)  sid={req_sid}  tick={target_tick}"
                           f"  → {chal_ip}:{resp_port}", flush=True)
                     break
             else:
-                pending[target_tick] = (nonce, chal_ip, resp_port, time.time() + 5.0)
+                pending[(req_sid, target_tick)] = (nonce, chal_ip, resp_port, time.time() + 5.0)
 
     now = time.time()
     pending = {t: v for t, v in pending.items() if v[3] > now}

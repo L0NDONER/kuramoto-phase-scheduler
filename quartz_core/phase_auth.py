@@ -6,10 +6,14 @@ Issues a challenge on the carrier, independently observes the target tick,
 and verifies the prover's response. No stored secret — presence IS the proof.
 
 Protocol:
-  1. Challenger picks target_tick = current_tick + AHEAD
-  2. Broadcasts: nonce(16) | target_tick(I) | resp_port(H)  on 239.0.0.5:7451
-  3. Both sides observe AxisPulse at target_tick → (θ, pd)
+  1. Challenger picks target_tick = current_tick + AHEAD, on whichever sid
+     it just locked onto — tick is a per-node counter (each quartz_beacon.py
+     instance starts counting from 0 at its own startup), not a shared
+     clock, so a target_tick is only meaningful paired with a sid.
+  2. Broadcasts: nonce(16) | target_tick(I) | resp_port(H) | sid(B)  on 239.0.0.5:7451
+  3. Both sides observe AxisPulse at (sid, target_tick) → (θ, pd)
   4. Prover sends: nonce(16) | SHA256(nonce + tick + θ + pd)  to challenger:7452
+     (θ/pd from the same sid's stream — tick alone is ambiguous)
   5. Challenger computes same hash, checks match
 
 Security properties:
@@ -35,7 +39,7 @@ PA_GRP       = "239.0.0.5"; PA_CHAL_PORT = 7451
 PA_RESP_PORT = 7452
 
 # Wire formats
-CHAL_FMT   = "!H16sIH";   CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIH")
+CHAL_FMT   = "!H16sIHB";  CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIHB")
 RESP_FMT   = "!H16s32s";  RESP_MAGIC = 0x5052; RESP_SIZE = struct.calcsize("!H16s32s")
 
 CHALLENGE_AHEAD = 30    # ticks ahead to set target_tick (~300ms at 100 tps, axis_pulse.AP_TICK_S)
@@ -77,9 +81,11 @@ def run_challenge():
     sel.register(ap_sock,   selectors.EVENT_READ, data="ap")
     sel.register(resp_sock, selectors.EVENT_READ, data="resp")
 
-    # Wait for a tick to know current tick number
+    # Wait for a tick to know current tick number — and which sid it came
+    # from, since tick is only meaningful relative to one node's counter.
     print("[phase_auth] waiting for AxisPulse lock...", flush=True)
     current_tick = None
+    locked_sid   = None
     while current_tick is None:
         for key, _ in sel.select(timeout=2.0):
             if key.data == "ap":
@@ -88,15 +94,16 @@ def run_challenge():
                     f = struct.unpack_from(AP_FMT, data)
                     if f[0] == AP_MAGIC and f[2]:
                         current_tick = f[3]
+                        locked_sid   = f[1]
 
     target_tick = current_tick + CHALLENGE_AHEAD
     nonce       = os.urandom(16)
 
-    chal_pkt = struct.pack(CHAL_FMT, CHAL_MAGIC, nonce, target_tick, PA_RESP_PORT)
+    chal_pkt = struct.pack(CHAL_FMT, CHAL_MAGIC, nonce, target_tick, PA_RESP_PORT, locked_sid)
     chal_out.sendto(chal_pkt, (PA_GRP, PA_CHAL_PORT))
-    print(f"[phase_auth] challenge  nonce={nonce.hex()[:12]}…  target_tick={target_tick}", flush=True)
+    print(f"[phase_auth] challenge  nonce={nonce.hex()[:12]}…  sid={locked_sid}  target_tick={target_tick}", flush=True)
 
-    # Observe target_tick independently
+    # Observe (locked_sid, target_tick) independently
     expected_hash = None
     deadline      = time.time() + 5.0   # wait up to 5s for target tick
 
@@ -106,10 +113,10 @@ def run_challenge():
                 data, _ = ap_sock.recvfrom(64)
                 if len(data) >= AP_SIZE:
                     f = struct.unpack_from(AP_FMT, data)
-                    if f[0] == AP_MAGIC and f[2] and f[3] == target_tick:
+                    if f[0] == AP_MAGIC and f[2] and f[1] == locked_sid and f[3] == target_tick:
                         theta, pd = f[4], f[6]
                         expected_hash = make_hash(nonce, target_tick, theta, pd)
-                        print(f"[phase_auth] observed  tick={target_tick}  θ={theta:.4f}  pd={pd:.4f}", flush=True)
+                        print(f"[phase_auth] observed  sid={locked_sid}  tick={target_tick}  θ={theta:.4f}  pd={pd:.4f}", flush=True)
 
     if expected_hash is None:
         print("[phase_auth] FAIL — target tick never observed", flush=True)
