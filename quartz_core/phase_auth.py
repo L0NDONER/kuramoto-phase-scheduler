@@ -115,7 +115,11 @@ def run_challenge():
         print("[phase_auth] FAIL — target tick never observed", flush=True)
         return False
 
-    # Wait for prover response
+    # Wait for prover response. A matching nonce with a wrong digest is not
+    # authoritative — the nonce is broadcast in cleartext on multicast, so
+    # any off-path listener can echo it back with garbage and race the real
+    # prover, who has to wait to observe a *future* tick. Keep listening
+    # until either a correct digest arrives or the window closes.
     deadline = time.time() + WINDOW_S
     while time.time() < deadline:
         for key, _ in sel.select(timeout=0.1):
@@ -131,10 +135,9 @@ def run_challenge():
                             print(f"[phase_auth] PASS  prover={addr[0]}", flush=True)
                             return True
                         else:
-                            print(f"[phase_auth] FAIL  hash mismatch  prover={addr[0]}", flush=True)
-                            return False
+                            print(f"[phase_auth] REJECTED  hash mismatch  prover={addr[0]}  (still waiting)", flush=True)
 
-    print("[phase_auth] FAIL — no response in window", flush=True)
+    print("[phase_auth] FAIL — no correct response in window", flush=True)
     return False
 
 
