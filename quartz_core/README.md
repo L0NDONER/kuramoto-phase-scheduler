@@ -92,9 +92,21 @@ Claimed security properties (from the module docstring):
   (`CHALLENGE_AHEAD = 30` ticks at 100 tps). Measured against a live
   local carrier (2026-08-08, 6 runs): actual challenge-to-observed-tick
   delay ran 314–329ms, consistently 5–10% over the 300ms nominal
-  figure (`select()`/scheduling overhead, not carrier jitter — the
-  carrier's own `pd_dev` held at ~0.00006 across the same runs). The
-  observed-tick-to-PASS verify leg was tight, 6–9ms.
+  figure — not carrier jitter (the carrier's own `pd_dev` held at
+  ~0.00006 across the same runs). The observed-tick-to-PASS verify leg
+  was tight, 6–9ms.
+
+  **Diagnosed (2026-08-09):** the observe loop reads every AxisPulse
+  packet from both live sids (~200pps combined) while waiting for the
+  one matching `(sid, tick)`, and each `select()`+`recvfrom()`+
+  `struct.unpack`+compare costs a fairly constant ~0.25ms in CPython.
+  10 instrumented runs logged 60–61 packets processed per run;
+  overshoot ÷ packet count clustered tightly at 0.23–0.28ms/packet —
+  that alone accounts for the full 14–17ms gap. GC was checked and
+  ruled out (zero collections fell inside the send→observe window on
+  any run). At 0.5% of the 3s `WINDOW_S` margin, this is noise, not a
+  defect — not worth optimizing unless the window is tightened a lot
+  further.
 - **adjacency** — AxisPulse multicast doesn't route off-LAN, so a
   correct response implies LAN presence.
 - **geometry-member** — `pd` ties the response to a specific oscillator
@@ -209,9 +221,6 @@ ever needs to gate something real, it needs, in order:
 
 - `quartz_beacon.py` needs root (HPET mmap on `mint`, `adjtimex` on
   `pi`/`pi2`).
-- `phase_auth_prover.py` runs its receive loop at import time (no
-  `if __name__ == "__main__"` guard) — importing it (rather than
-  running it as a script) blocks immediately.
 - No AxisPulse carrier is deployed anywhere as of 2026-08-08 (the old
   beacon deployment was decommissioned 2026-07-29); it has only been
   run ad hoc, locally, for the timing/fault-injection tests above —
