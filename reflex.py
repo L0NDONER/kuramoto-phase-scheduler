@@ -32,6 +32,16 @@ PARK_TEMP      = 1.00   # thermal stress → PARK
 RECOVER_TEMP   = 0.40   # must cool below this to begin RECOVER
 AP_STALE_S     = 5.0    # no AxisPulse → WITHDRAW
 
+# pd_dev alone can't see a peer going stale: a frozen peer's theta makes pd
+# drift smoothly as our own theta advances, so the frame-to-frame EMA in
+# pd_dev stays low for the full PEER_STALE_S (3.0s in quartz_beacon.py)
+# window before that sid's own packets finally stop. peer_age_s (AP_FMT
+# slot 8, carried in every packet since 2026-08-09) is seconds since the
+# broadcasting node's peer last sent it a RAW update — this rises well
+# before pd_dev does, so it's checked independently, not as a replacement.
+ALERT_AGE_S    = 1.5    # peer_age_s rising → treat as noisy even if pd_dev looks calm
+WITHDRAW_AGE_S = 2.5    # peer_age_s nearing quartz_beacon's 3.0s cutoff → treat as ragged
+
 # -- Hysteresis --
 CALM_HOLD_S    = 5.0    # clear this long to exit ALERT → CALM
 RECOVER_HOLD_S = 10.0   # stable this long to exit RECOVER → CALM
@@ -78,6 +88,7 @@ pd_ema = 0.0; temlum_ema = 0.0   # smoothed inputs for threshold decisions
 # per-sid pd_dev EMA — 3 independent quartz witnesses, not one flapping scalar
 sid_pd_ema  = {}   # sid -> ema
 sid_last_t  = {}   # sid -> last packet time
+sid_peer_age = {}  # sid -> latest peer_age_s reported by that sid's own beacon
 SID_STALE_S = 3.0
 
 
@@ -101,12 +112,15 @@ def go(new):
         return
     now  = time.time()
     live = [sid for sid, t in sid_last_t.items() if (now - t) < SID_STALE_S]
-    votes    = {sid: round(sid_pd_ema[sid], 4) for sid in live}
-    worst_pd = max((sid_pd_ema[sid] for sid in live), default=0.0)
-    n_noisy  = sum(1 for sid in live if sid_pd_ema[sid] > ALERT_PD)
+    votes     = {sid: round(sid_pd_ema[sid], 4) for sid in live}
+    worst_pd  = max((sid_pd_ema[sid] for sid in live), default=0.0)
+    worst_age = max((sid_peer_age.get(sid, 0.0) for sid in live), default=0.0)
+    n_noisy  = sum(1 for sid in live
+                    if sid_pd_ema[sid] > ALERT_PD or sid_peer_age.get(sid, 0.0) > ALERT_AGE_S)
     p_vote   = n_noisy / len(live) if live else 1.0
     print(f"[reflex] {_NAME[state]} → {_NAME[new]}  votes={votes} "
-          f"bits_vote={surprise_bits(p_vote):.3f} pd_ratio={worst_pd/ALERT_PD:.3f}", flush=True)
+          f"bits_vote={surprise_bits(p_vote):.3f} pd_ratio={worst_pd/ALERT_PD:.3f} "
+          f"age_ratio={worst_age/WITHDRAW_AGE_S:.3f}", flush=True)
     state = new
     alert_clear_since = recover_since = None
 
@@ -121,10 +135,11 @@ while True:
             if len(data) >= _AP_SIZE:
                 f = struct.unpack_from(_AP_FMT, data)
                 if f[0] == _AP_MAGIC and f[2]:   # locked only
-                    sid, pkt_pd_dev = f[1], f[7]
+                    sid, pkt_pd_dev, pkt_peer_age = f[1], f[7], f[8]
                     prev = sid_pd_ema.get(sid, pkt_pd_dev)
-                    sid_pd_ema[sid] = 0.20 * pkt_pd_dev + 0.80 * prev
-                    sid_last_t[sid] = time.time()
+                    sid_pd_ema[sid]   = 0.20 * pkt_pd_dev + 0.80 * prev
+                    sid_last_t[sid]   = time.time()
+                    sid_peer_age[sid] = pkt_peer_age
                     pd_dev    = pkt_pd_dev   # latest raw reading, for telemetry only
                     last_ap_t = time.time()
         elif tag == "ns":
@@ -142,8 +157,10 @@ while True:
     warm   = temlum_ema > ALERT_TEMP
 
     live_sids = [sid for sid, t in sid_last_t.items() if (now - t) < SID_STALE_S]
-    n_noisy   = sum(1 for sid in live_sids if sid_pd_ema[sid] > ALERT_PD)
-    n_ragged  = sum(1 for sid in live_sids if sid_pd_ema[sid] > WITHDRAW_PD)
+    n_noisy   = sum(1 for sid in live_sids
+                     if sid_pd_ema[sid] > ALERT_PD or sid_peer_age.get(sid, 0.0) > ALERT_AGE_S)
+    n_ragged  = sum(1 for sid in live_sids
+                     if sid_pd_ema[sid] > WITHDRAW_PD or sid_peer_age.get(sid, 0.0) > WITHDRAW_AGE_S)
     quorum    = max(2, (len(live_sids) // 2) + 1) if live_sids else 1
 
     # majority of witnesses, not whichever pairwise packet arrived last

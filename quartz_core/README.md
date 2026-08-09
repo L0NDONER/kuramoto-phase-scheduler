@@ -201,16 +201,25 @@ no raw sockets:
      `theta` is frozen while ours keeps advancing) before correctly
      dropping to `locked=False no peers` at the 3s mark. Removing the
      rule re-locked immediately at `dev=0.00006`, back to baseline.
-   - **Blind spot:** `dev` is the EMA of *frame-to-frame* `pd` change,
-     and a frozen peer produces smooth, predictable drift rather than
-     noise — so `dev` stayed flat (~0.011) for the entire 3-second
-     window where `pd` itself was meaningless, right up until the peer
-     was dropped. Anything treating `dev` as a live trust/health signal
-     has a blind window exactly where a dying peer matters most. Not
-     fixed yet — would need a second signal (e.g. time-since-last-RAW-
-     packet-from-this-peer) alongside `dev`, not a `dev` threshold
-     change, since the metric is measuring the wrong thing for this
-     failure mode.
+   - **Blind spot — found and fixed (2026-08-09).** `dev` is the EMA
+     of *frame-to-frame* `pd` change, and a frozen peer produces
+     smooth, predictable drift rather than noise — so `dev` stayed
+     flat (~0.011) for the entire 3-second window where `pd` itself
+     was meaningless, right up until the peer was dropped. Anything
+     treating `dev` as a live trust/health signal has a blind window
+     exactly where a dying peer matters most. Fixed by repurposing the
+     AxisPulse packet's dead `load_avg` slot (always `0.0`, unread by
+     any consumer in the codebase) to carry `peer_age_s` — seconds
+     since the broadcasting node's peer last sent a RAW update, which
+     `quartz_beacon.py` already tracked internally but never exposed.
+     `reflex.py` (the one real consumer doing threshold classification
+     on `pd_dev`, via `ALERT_PD`/`WITHDRAW_PD`) now also checks
+     `ALERT_AGE_S = 1.5` / `WITHDRAW_AGE_S = 2.5` against `peer_age_s`
+     independently of `pd_dev`. Verified live: under the same RAW-loss
+     injection, `age_ratio` drove `CALM → ALERT → WITHDRAW` while
+     `pd_ratio` stayed at ~0.07 the whole time — `reflex.py` reached
+     `WITHDRAW` before the beacon's own `PEER_STALE_S` cliff, then
+     fully recovered to `CALM` once the link was restored.
 
 Not yet tested: reordering (vs. pure loss) on either multicast group,
 prover restart mid-window, clock step during a challenge, concurrent
@@ -222,7 +231,7 @@ stands — five fault scenarios covered so far, not a systematic matrix.
 | Packet | Group:port | Format | Notes |
 |---|---|---|---|
 | RAW | `239.0.0.1:7400` | `!HBIffBQ` (24B) | magic, sid, tick, theta, omega, pad, t0_ns |
-| AxisPulse | `239.0.0.2:7404` | `>HBBIfffffHQ` (38B) | magic, sid, locked, tick, theta1, theta2, pd, pd_dev, load_avg, drains, t0_ns |
+| AxisPulse | `239.0.0.2:7404` | `>HBBIfffffHQ` (38B) | magic, sid, locked, tick, theta1, theta2, pd, pd_dev, peer_age_s, drains, t0_ns |
 | Challenge | `239.0.0.5:7451` | `!H16sIHB` | magic, nonce, target_tick, resp_port, sid |
 | Response | unicast, `resp_port` | `!H16s32s` | magic, nonce, sha256 digest |
 

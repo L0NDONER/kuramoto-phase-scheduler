@@ -39,8 +39,17 @@ RAW_FMT   = "!HBIffBQ"          # magic, sid, tick, theta, omega, _pad, t0_ns â€
 RAW_SIZE  = struct.calcsize(RAW_FMT)
 
 AP_MAGIC  = 0x4158
-AP_FMT    = ">HBBIfffffHQ"      # magic,sid,locked,tick,theta1,theta2,pd,pd_dev,load_avg,drains,t0_ns
+AP_FMT    = ">HBBIfffffHQ"      # magic,sid,locked,tick,theta1,theta2,pd,pd_dev,peer_age_s,drains,t0_ns
 AP_SIZE   = struct.calcsize(AP_FMT)
+# peer_age_s (slot 8, formerly an always-0.0 "load_avg" field no consumer
+# read) is seconds since the last valid RAW packet from the live peer.
+# dev alone can't detect a stale-but-not-yet-dropped peer: a frozen peer's
+# theta makes pd drift smoothly as our own theta advances, so the frame-to-
+# frame EMA in dev stays low right up until PEER_STALE_S finally expires
+# (measured live 2026-08-09: dev held ~0.011 for the full 3s stale window
+# while pd itself swung +1.77 -> +2.86 -> -2.33). Consumers doing health
+# classification on dev (e.g. reflex.py's ALERT_PD/WITHDRAW_PD) need this
+# alongside dev, not instead of it.
 
 OMEGA0        = 1.06     # rad/s â€” shared nominal carrier (beacon.c: ~0.053 rad / 50ms tick).
                           # ppm is a fractional correction on this carrier, not a carrier itself.
@@ -205,9 +214,10 @@ def main():
                     p["pd_ema"] = PD_EMA_ALPHA * abs(pd - p["pd_prev"]) + (1 - PD_EMA_ALPHA) * p["pd_ema"]
                 p["pd_prev"] = pd
 
+                peer_age_s = now - p["t"]
                 ap_pkt = struct.pack(AP_FMT, AP_MAGIC, sid, 1, tick,
                                       theta_self, p["theta"], pd, p["pd_ema"],
-                                      0.0, 0, t0_ns)
+                                      peer_age_s, 0, t0_ns)
                 ap_out.sendto(ap_pkt, (AP_GRP, AP_PORT))
         else:
             ap_pkt = struct.pack(AP_FMT, AP_MAGIC, sid, 0, tick,
