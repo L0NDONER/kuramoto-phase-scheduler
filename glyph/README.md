@@ -138,12 +138,34 @@ confirmed send and prints it — no SSH needed to see the outcome.
 Verified live: `'EC2 result: unknown intent 'hello ec2 test''` arrived
 automatically for a non-intent test string.
 
-### Operational note
+### Persistent daemon (2026-08-09)
 
-`jitter_wan_rx.py` is single-shot — it handles exactly one burst then
-exits, not a persistent daemon. It needs restarting on EC2 before each
-send. Found by testing a retry scenario: attempt 1's mismatch consumed
-the one running instance, so attempts 2/3 had nothing listening and
-correctly (if confusingly, until traced) timed out. Not fixed into a
-loop yet — worth doing if this becomes more than an occasional manual
-trigger.
+`jitter_wan_rx.py` was single-shot — handled exactly one burst then
+exited, needing a manual restart before each send. Found by testing a
+retry scenario: attempt 1's mismatch consumed the one running instance,
+so attempts 2/3 had nothing listening and correctly (if confusingly,
+until traced) timed out. Fixed: `receive_one_burst()`/`handle_burst()`
+factored out of `main()`, which now loops forever on the same bound
+socket. Verified live: two consecutive sends confirmed cleanly against
+the same running instance (pid unchanged), and it survived a couple of
+garbled partial bursts from interrupted test sends without crashing,
+just moved on to the next one.
+
+### Known limitation: no framing across concurrent senders
+
+Confirmed live (2026-08-09), not just a theoretical concern: two
+overlapping sends corrupt each other. `receive_one_burst()` collects
+every tick arriving within any 1s gap into one lump, and `seq` is
+per-sender (every `jitter_wan_tx.py` process starts its own stream at
+`seq=0`), so two independent senders' ticks sort into one scrambled
+mess with no way to tell them apart. Reproduced with two staggered raw
+tick streams ("message alpha" at t+0, "message beta" at t+4, ~21s of
+real overlap): the receiver logged `received 4798 ticks -> 199 bits`
+(2496 + 2304 - 2, i.e. both streams merged into one burst) and decoded
+pure garbage (`'������������������������'`).
+
+Not fixed. The real fix would be a per-transmission session id embedded
+in every tick packet (not just `seq`) so the receiver can separate
+interleaved streams before decoding — worth doing if this is ever used
+by more than one operator/script at a time; for now, single-sender use
+only.

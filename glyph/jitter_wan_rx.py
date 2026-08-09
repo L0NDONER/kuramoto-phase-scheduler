@@ -30,7 +30,13 @@ transport blind. 9/10 real-WAN trials landed 0 bit errors and 1/10 had
 a single bit error (see quartz-substrate notes) -- close enough that a
 retry layer, not more threshold tuning, is what actually closes the gap.
 
-Usage: run on EC2.
+Persistent daemon (2026-08-09): loops forever handling one burst at a
+time on the same bound socket, rather than exiting after the first
+message. Previously single-shot -- found live when a retry's second
+attempt had nothing listening because the first attempt's mismatch had
+already consumed the one running instance.
+
+Usage: run on EC2, e.g. under systemd or nohup. Ctrl-C / SIGTERM to stop.
 """
 import socket, struct, subprocess, sys, time
 
@@ -135,23 +141,12 @@ def _cli_arg(flag):
     return None
 
 
-def main():
-    execute = "--execute" in sys.argv
-    thresh_arg = _cli_arg("--threshold")
-    thresh = float(thresh_arg) / 1000.0 if thresh_arg else THRESH
-    expect = _cli_arg("--expect")
-
-    s = mcast_in()
-    print(f"[jitter-wan-rx] listening on {BIND_IP}:{PORT}  execute={execute}  "
-          f"threshold={thresh*1000:.1f}ms", flush=True)
-
-    # (seq, arrival_time) -- real WAN paths reorder packets (unlike the
-    # LAN version, single host, effectively FIFO). decode() assumes send
-    # order; sort by the sender's seq before decoding, don't trust
-    # arrival order (found live 2026-08-09: raw arrival order produced a
-    # completely garbled decode, unrelated to jitter margin at all).
+def receive_one_burst(s):
+    """Blocks indefinitely for the first tick of a new burst, then
+    switches to short idle-detection to find the burst's end. Returns
+    the sorted list of arrival timestamps."""
     received = []
-    s.settimeout(30.0)
+    s.settimeout(None)   # block indefinitely between messages -- persistent daemon
     while True:
         try:
             data, addr = s.recvfrom(64)
@@ -165,8 +160,17 @@ def main():
         received.append((seq, time.time()))
         s.settimeout(1.0)   # 1s idle (WAN margin) = end of burst
 
+    # (seq, arrival_time) -- real WAN paths reorder packets (unlike the
+    # LAN version, single host, effectively FIFO). decode() assumes send
+    # order; sort by the sender's seq before decoding, don't trust
+    # arrival order (found live 2026-08-09: raw arrival order produced a
+    # completely garbled decode, unrelated to jitter margin at all).
     received.sort(key=lambda r: r[0])
-    ticks = [t for _, t in received]
+    return [t for _, t in received]
+
+
+def handle_burst(s, thresh, expect, execute):
+    ticks = receive_one_burst(s)
     n_bits = len(ticks) // TICKS_PER_BIT
     print(f"[jitter-wan-rx] received {len(ticks)} ticks -> {n_bits} bits", flush=True)
 
@@ -204,6 +208,21 @@ def main():
                f"stderr={result.stderr.strip()!r}")
     print(f"[jitter-wan-rx] EXECUTED {intent}: {summary}", flush=True)
     send_signed(1, summary, RESULT_PORT)
+
+
+def main():
+    execute = "--execute" in sys.argv
+    thresh_arg = _cli_arg("--threshold")
+    thresh = float(thresh_arg) / 1000.0 if thresh_arg else THRESH
+    expect = _cli_arg("--expect")
+
+    s = mcast_in()
+    print(f"[jitter-wan-rx] listening on {BIND_IP}:{PORT}  execute={execute}  "
+          f"threshold={thresh*1000:.1f}ms  (persistent)", flush=True)
+
+    while True:
+        handle_burst(s, thresh, expect, execute)
+        print("[jitter-wan-rx] --- waiting for next burst ---", flush=True)
 
 
 if __name__ == "__main__":
