@@ -21,7 +21,7 @@ from ec2_intent_common import (load_key, pack, unpack_response,
 sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
 from quartz_core.phase_auth import gate_check
 
-EC2_HOST = "100.21.200.15"
+EC2_HOST = "10.8.0.1"   # WireGuard-only, matches ec2_intent_listener.py's BIND_IP
 EC2_PORT = 58551
 
 STATUS_NAME = {ACCEPTED: "ACCEPTED", REJECTED: "REJECTED",
