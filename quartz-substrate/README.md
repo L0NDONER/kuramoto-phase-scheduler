@@ -163,6 +163,54 @@ confirmed live, 2026-07-29.
   via bare `$var` doesn't re-parse embedded quotes) that silently made
   two of the five kills no-ops and produced false failures.
 
+## Fault injection (network degradation)
+
+`quartz_node.c`'s port (`PORT 5000`, UDP) carries the actual phase-coupling
+traffic `quartz_peer_health.json` and `truthd`'s tier computation both
+depend on. Tested live on Mint (2026-08-09) with `tc`, scoped to just that
+port so nothing else on the interface (SSH, WireGuard, other LAN traffic)
+is touched:
+
+```
+ip link add ifb0 type ifb && ip link set ifb0 up
+tc qdisc add dev enp0s31f6 handle ffff: ingress
+tc filter add dev enp0s31f6 parent ffff: protocol ip u32 \
+    match ip dport 5000 0xffff action mirred egress redirect dev ifb0
+tc qdisc add dev ifb0 root netem loss <N>%
+```
+
+Redirects only inbound UDP:5000 (Mint's peer-health traffic from pi/pi2)
+through `ifb0` for `netem` to degrade, leaving egress and every other port
+on the real interface untouched. Deliberately not applied on `pi` — it's
+the Firestick bump-in-wire host and has no passwordless sudo, so a botched
+mid-test rollback there would degrade real household streaming with no
+easy remote fix; Mint has neither constraint and is still a real leg of
+the triad (Mint↔pi, Mint↔pi2 both terminate here).
+
+| loss | peers | `dev` | tier |
+|---|---|---|---|
+| baseline | healthy | ~0.0004 | `TIER_FULL` |
+| 30% | healthy | ~0.0026 | `TIER_FULL` |
+| 70% | healthy | ~0.017 | `TIER_FULL` |
+| 100% | **unhealthy** | ~0.016 | **`TIER_PARTITIONED`** |
+| restored | healthy | ~0.0004 | `TIER_FULL` |
+
+Held healthy through 30–70% average loss — `quartz_node.c`'s
+`HEALTH_TIMEOUT_S=0.5` is silence-duration-based (50 missed sends at the
+100Hz/10ms cadence), not average-loss-based, so intermittent drops don't
+trip it as long as *some* packet lands often enough. Only sustained 100%
+loss (a real silence gap past 0.5s) flipped both peers `healthy: false`
+and correctly dropped `truthd`'s tier `TIER_FULL → TIER_PARTITIONED`.
+Teardown (`tc qdisc del dev enp0s31f6 ingress; ip link del ifb0`) restored
+both peers and the tier within one health-file write cycle (~1s).
+
+This also verified, incidentally: Mint didn't have its own `quartz-node`/
+`quartz-presence-chain` systemd units before this session — `pi` and `pi2`
+already had them (identical unit shape, `ExecStart` args differing only in
+node id and peer IPs; ids observed live: pi=2, pi2=3), Mint was the
+missing third leg. Added matching units on Mint (id=1, peers=[pi, pi2]) so
+all three hosts now run the same systemd-managed pattern.
+
 ## What this replaced
 
 Until 2026-07-29 there was a separate always-on timing swarm plus a
