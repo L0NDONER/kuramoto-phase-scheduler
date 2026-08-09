@@ -272,10 +272,25 @@ corruption all from one tool, fully isolated on the namespace's own
 traffic on the host. Preferred over `iptables` for any future fault
 injection here.
 
-Not yet tested: prover restart mid-window, clock step during a
-challenge. Point 2 of [Production gaps](#production-gaps) below still
-stands — seven fault
-scenarios covered so far, not a systematic matrix.
+8. **Prover restart mid-window — tested, held clean, no fix needed
+   (2026-08-09).** Killed `phase_auth_prover.py` 0.15s into an
+   in-flight challenge (before it could respond): challenger correctly
+   `FAIL`ed after the full `WINDOW_S` (3s), no hang, clean exit.
+   Restarted the prover: the very next challenge `PASS`ed immediately,
+   full recovery. Architectural note, not a bug: a challenge is a
+   one-shot multicast broadcast, not persisted anywhere — if the
+   prover is down at the exact moment a challenge is sent, restarting
+   it afterward can't retroactively catch that specific challenge, the
+   broadcast is already gone. The clean `FAIL` is the correct outcome
+   for that case.
+
+Not yet tested: clock step during a challenge — left untested on
+purpose, not worth stepping the system clock on a shared machine to
+find out; better reasoned about by reading the deadline code (plain
+`time.time()` throughout `phase_auth.py`/`phase_auth_prover.py`, no
+monotonic clock) than by actually doing it. Point 2 of [Production
+gaps](#production-gaps) below still stands — eight fault scenarios
+covered so far, not a systematic matrix.
 
 ## Wire formats
 
