@@ -18,6 +18,14 @@ the ack and resending on mismatch/timeout closes the gap, rather than
 chasing threshold tuning further. Re-runs gate_check() on every retry,
 not just once -- each attempt is its own presence proof.
 
+session_id: every tick packet carries a random 32-bit session_id, not
+just a sender-local seq. Found live (2026-08-09) that two overlapping
+sends corrupt each other on the receiver: seq alone can't disambiguate
+two independent senders (each starts its own stream at seq=0), so their
+ticks sorted into one scrambled mess. jitter_wan_rx.py now buckets
+incoming ticks by session_id and finalizes each session on its own idle
+timer, so concurrent sends no longer interfere.
+
 Usage:
     python3 glyph/jitter_wan_tx.py "text to send"
 """
@@ -61,8 +69,10 @@ def sleep_until(t):
 
 def send_burst(text):
     bits = text_to_bits(text)
+    session_id = random.getrandbits(32)   # fresh per attempt, disambiguates concurrent senders
     print(f"[jitter-wan-tx] {text!r} -> {len(bits)} bits, "
-          f"{len(bits) * TICKS_PER_BIT} ticks -> {EC2_WG_IP}:{PORT}", flush=True)
+          f"{len(bits) * TICKS_PER_BIT} ticks -> {EC2_WG_IP}:{PORT}  "
+          f"session_id={session_id:#010x}", flush=True)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rng = random.Random()
@@ -72,7 +82,7 @@ def send_burst(text):
         for _ in range(TICKS_PER_BIT):
             jitter = rng.gauss(0, JITTER_SIGMA) if bit else 0.0
             sleep_until(next_at + jitter)
-            sock.sendto(struct.pack(">HI", MAGIC, seq), (EC2_WG_IP, PORT))
+            sock.sendto(struct.pack(">HII", MAGIC, seq, session_id), (EC2_WG_IP, PORT))
             seq += 1
             next_at += TICK_S
     print(f"[jitter-wan-tx] done — {seq} ticks sent, waiting for ack...", flush=True)

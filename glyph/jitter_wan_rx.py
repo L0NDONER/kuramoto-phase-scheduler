@@ -36,6 +36,17 @@ message. Previously single-shot -- found live when a retry's second
 attempt had nothing listening because the first attempt's mismatch had
 already consumed the one running instance.
 
+Session multiplexing (2026-08-09): every tick packet carries a random
+32-bit session_id, not just a sender-local seq. Found live that two
+overlapping sends corrupt each other -- seq alone can't disambiguate
+two independent senders (each starts its own stream at seq=0), so a
+single shared bucket with one global idle timer scrambled both streams
+into one garbled decode (confirmed: 2496 + 2304 ticks from two real
+overlapping sends merged into one 4798-tick burst that decoded to pure
+mush). Now buckets incoming ticks by session_id and finalizes each
+session independently on its own 1s idle timer, so concurrent sends no
+longer interfere with each other.
+
 Usage: run on EC2, e.g. under systemd or nohup. Ctrl-C / SIGTERM to stop.
 """
 import socket, struct, subprocess, sys, time
@@ -141,38 +152,70 @@ def _cli_arg(flag):
     return None
 
 
-def receive_one_burst(s):
-    """Blocks indefinitely for the first tick of a new burst, then
-    switches to short idle-detection to find the burst's end. Returns
-    the sorted list of arrival timestamps."""
-    received = []
-    s.settimeout(None)   # block indefinitely between messages -- persistent daemon
+IDLE_S = 1.0        # per-session idle (WAN margin) = that session's burst is done
+POLL_S = 0.2        # how often to check all sessions for idle, while also recv'ing
+
+# Hard caps, independent of idle detection. Without these a session that
+# gets fed faster than IDLE_S apart never finalizes at all -- confirmed
+# live 2026-08-09: 16 packets sent one every 0.5s (< IDLE_S=1.0) sat in
+# memory for the full 8s with zero finalization, only closing out ~1s
+# after the sender actually stopped. Longest real message so far
+# (restart_wg_easy, 15 chars) is 2880 ticks; both caps sit well above
+# any real use and well below "grows forever."
+MAX_TICKS_PER_SESSION = 20000
+MAX_SESSION_AGE_S     = 60.0
+
+
+def collect_sessions(s, on_session_done):
+    """Runs forever. Buckets incoming ticks by session_id (not a single
+    shared list), and calls on_session_done(session_id, ticks) for any
+    session that's gone IDLE_S without a new packet -- independently of
+    every other session currently in flight. This is what actually fixes
+    the overlap bug: two concurrent senders each get their own bucket
+    and their own idle clock, so neither's ticks leak into the other's
+    decode. Also force-finalizes (and discards from tracking) any
+    session that hits MAX_TICKS_PER_SESSION or MAX_SESSION_AGE_S
+    regardless of whether it's still actively receiving -- otherwise a
+    session fed faster than IDLE_S apart never closes out at all."""
+    sessions = {}     # session_id -> [(seq, arrival_time), ...]
+    last_seen = {}     # session_id -> arrival_time of most recent packet
+    first_seen = {}    # session_id -> arrival_time of first packet
+
+    s.settimeout(POLL_S)
     while True:
         try:
             data, addr = s.recvfrom(64)
+            if len(data) >= 10:
+                magic, seq, session_id = struct.unpack(">HII", data[:10])
+                if magic == MAGIC:
+                    now = time.time()
+                    sessions.setdefault(session_id, []).append((seq, now))
+                    last_seen[session_id] = now
+                    first_seen.setdefault(session_id, now)
         except socket.timeout:
-            break
-        if len(data) < 6:
-            continue
-        magic, seq = struct.unpack(">HI", data[:6])
-        if magic != MAGIC:
-            continue
-        received.append((seq, time.time()))
-        s.settimeout(1.0)   # 1s idle (WAN margin) = end of burst
+            pass   # just a poll tick, not a real timeout -- check idle sessions below
 
-    # (seq, arrival_time) -- real WAN paths reorder packets (unlike the
-    # LAN version, single host, effectively FIFO). decode() assumes send
-    # order; sort by the sender's seq before decoding, don't trust
-    # arrival order (found live 2026-08-09: raw arrival order produced a
-    # completely garbled decode, unrelated to jitter margin at all).
-    received.sort(key=lambda r: r[0])
-    return [t for _, t in received]
+        now = time.time()
+        done = [sid for sid, t in last_seen.items()
+                if now - t > IDLE_S
+                or len(sessions[sid]) > MAX_TICKS_PER_SESSION
+                or now - first_seen[sid] > MAX_SESSION_AGE_S]
+        for sid in done:
+            # (seq, arrival_time) -- real WAN paths reorder packets. decode()
+            # assumes send order; sort by the sender's seq before decoding,
+            # don't trust arrival order (found live 2026-08-09: raw arrival
+            # order produced a completely garbled decode).
+            received = sessions.pop(sid)
+            del last_seen[sid]
+            del first_seen[sid]
+            received.sort(key=lambda r: r[0])
+            on_session_done(sid, [t for _, t in received])
 
 
-def handle_burst(s, thresh, expect, execute):
-    ticks = receive_one_burst(s)
+def handle_burst(session_id, ticks, thresh, expect, execute):
     n_bits = len(ticks) // TICKS_PER_BIT
-    print(f"[jitter-wan-rx] received {len(ticks)} ticks -> {n_bits} bits", flush=True)
+    print(f"[jitter-wan-rx] session={session_id:#010x}  received {len(ticks)} ticks "
+          f"-> {n_bits} bits", flush=True)
 
     bits = decode(ticks, n_bits, thresh)
     text = bits_to_text(bits)
@@ -218,11 +261,13 @@ def main():
 
     s = mcast_in()
     print(f"[jitter-wan-rx] listening on {BIND_IP}:{PORT}  execute={execute}  "
-          f"threshold={thresh*1000:.1f}ms  (persistent)", flush=True)
+          f"threshold={thresh*1000:.1f}ms  (persistent, session-multiplexed)", flush=True)
 
-    while True:
-        handle_burst(s, thresh, expect, execute)
-        print("[jitter-wan-rx] --- waiting for next burst ---", flush=True)
+    def on_session_done(session_id, ticks):
+        handle_burst(session_id, ticks, thresh, expect, execute)
+        print("[jitter-wan-rx] --- session done, still listening for others ---", flush=True)
+
+    collect_sessions(s, on_session_done)
 
 
 if __name__ == "__main__":

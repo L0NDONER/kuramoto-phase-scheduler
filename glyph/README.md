@@ -151,21 +151,24 @@ the same running instance (pid unchanged), and it survived a couple of
 garbled partial bursts from interrupted test sends without crashing,
 just moved on to the next one.
 
-### Known limitation: no framing across concurrent senders
+### Session multiplexing — found and fixed (2026-08-09)
 
-Confirmed live (2026-08-09), not just a theoretical concern: two
-overlapping sends corrupt each other. `receive_one_burst()` collects
-every tick arriving within any 1s gap into one lump, and `seq` is
-per-sender (every `jitter_wan_tx.py` process starts its own stream at
-`seq=0`), so two independent senders' ticks sort into one scrambled
-mess with no way to tell them apart. Reproduced with two staggered raw
-tick streams ("message alpha" at t+0, "message beta" at t+4, ~21s of
-real overlap): the receiver logged `received 4798 ticks -> 199 bits`
-(2496 + 2304 - 2, i.e. both streams merged into one burst) and decoded
-pure garbage (`'������������������������'`).
+Confirmed live, not just a theoretical concern: two overlapping sends
+corrupted each other. `receive_one_burst()` collected every tick
+arriving within any 1s gap into one lump, and `seq` was per-sender
+(every `jitter_wan_tx.py` process starts its own stream at `seq=0`), so
+two independent senders' ticks sorted into one scrambled mess with no
+way to tell them apart. Reproduced with two staggered raw tick streams
+("message alpha" at t+0, "message beta" at t+4, ~21s of real overlap):
+the receiver logged `received 4798 ticks -> 199 bits` (2496 + 2304 - 2,
+both streams merged into one burst) and decoded pure garbage
+(`'������������������������'`).
 
-Not fixed. The real fix would be a per-transmission session id embedded
-in every tick packet (not just `seq`) so the receiver can separate
-interleaved streams before decoding — worth doing if this is ever used
-by more than one operator/script at a time; for now, single-sender use
-only.
+Fixed: every tick packet now carries a random 32-bit `session_id`
+alongside `seq` (wire format `>HII`, up from `>HI`). The receiver's
+`collect_sessions()` replaced the single shared bucket with per-session
+buckets and per-session idle timers — each concurrent transmission
+finalizes independently on its own 1s silence, not a shared clock.
+Retested with the exact same overlap scenario that produced the garbage
+above: both sessions now decode cleanly and independently —
+`'message alpha'` and `'message beta'`, no mixing, no crosstalk.
