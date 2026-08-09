@@ -248,9 +248,33 @@ no raw sockets:
    - Retest: 5 rounds of simultaneous challenger pairs, 4 of which
      landed on the exact same `(sid, tick)`, all 10/10 `PASS`.
 
-Not yet tested: reordering (vs. pure loss) on either multicast group,
-prover restart mid-window, clock step during a challenge. Point 2 of
-[Production gaps](#production-gaps) below still stands — six fault
+7. **Packet reordering — tested, held clean, no fix needed
+   (2026-08-09).** Run in an isolated `ip netns` sandbox (not
+   `iptables` on the real interface — see methodology note below):
+   `tc qdisc ... netem delay <N>ms reorder <P>% <correlation>%` on the
+   namespace's own `lo`, two profiles — mild (10ms delay, 25%/50%
+   reorder) and aggressive (100ms delay, 50%/90% reorder). 18/18
+   `phase_auth` challenges `PASS`ed across both. Makes sense
+   architecturally: both the observe loop and the prover match
+   strictly on exact `(sid, tick)` value, never on arrival sequence,
+   so reordering has nothing to exploit. Useful side confirmation:
+   beacon `dev` climbed to 0.007–0.053 under reordering (real noise,
+   correctly detected) vs. the 0.011-flat-while-wrong reading from the
+   staleness blind spot above (item 5) — `dev` isn't broken in
+   general, it specifically can't see smooth/frozen drift.
+
+**Methodology note:** the loss tests (items 5–6 above) used scoped
+`iptables -m statistic --mode random` rules on the real interface,
+cleaned up after each run. This one used an isolated `ip netns`
+instead — `tc netem` covers loss, reorder, delay, duplication, and
+corruption all from one tool, fully isolated on the namespace's own
+`lo`, single-command teardown (`ip netns del`), zero risk to real
+traffic on the host. Preferred over `iptables` for any future fault
+injection here.
+
+Not yet tested: prover restart mid-window, clock step during a
+challenge. Point 2 of [Production gaps](#production-gaps) below still
+stands — seven fault
 scenarios covered so far, not a systematic matrix.
 
 ## Wire formats
