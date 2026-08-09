@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-wave-pacer.py — NFQUEUE pacer with DRR fairness, sine envelope from Pi1 quartz.
+wave-pacer.py — NFQUEUE pacer with DRR fairness, sine envelope from Pi1 quartz,
+plus a bounded adaptive boost driven by real queue-depth/drop feedback.
 
 iptables setup (already in shaper-setup.sh):
   iptables -t mangle -A POSTROUTING -o eth0 -j NFQUEUE --queue-num 10 --queue-maxlen 1024
@@ -25,6 +26,17 @@ TOKEN_BURST_S  = 0.05           # per-flow rate_bps enforced via token bucket, 5
 # Sine period derived from Pi1 adjtimex freq_ppm = -14.143646
 # abs(ppm) → seconds: this crystal's own deviation signature
 PERIOD_S       = 14.143646    # quartz-derived; do not hand-tune
+
+# Adaptive boost: real feedback from queue depth / drop rate, not a fixed
+# schedule and not ML - EWMA-smoothed congestion signal computed entirely
+# from Flow state this process already owns (no file/network/subprocess
+# I/O, so it costs nothing extra inside the locked hot loop). Boost only
+# ever adds on top of the sine envelope's 0.8-1.0 floor/ceiling; it never
+# reduces below 0.8, only relieves genuine congestion above 1.0.
+ADAPT_GAIN     = 0.2   # max extra envelope headroom when fully congested
+EWMA_ALPHA     = 0.1   # smoothing: ~10-tick (100ms) rise, few-second decay
+ENVELOPE_FLOOR = 0.8
+ENVELOPE_CEIL  = 0.8 + 0.2 + ADAPT_GAIN   # sine ceiling (1.0) + full adaptive boost
 
 # iptables mark → flow name
 MARK_FLOW = {
@@ -69,6 +81,11 @@ class WavePacer:
         self._lock = threading.Lock()
         self.running = False
 
+        # Adaptive-boost state
+        self._congestion_ewma = 0.0
+        self._last_total_drops = 0
+        self._max_queue_total = MAX_QUEUE_PKTS * len(self.flows)
+
     # ------------------------------------------------------------------
     # NFQUEUE callback — runs in nfq.run() thread
     # ------------------------------------------------------------------
@@ -86,6 +103,26 @@ class WavePacer:
             pkt.retain()                    # keep handle alive across threads
             payload = pkt.get_payload()
             flow.queue.append((pkt, payload))
+
+    # ------------------------------------------------------------------
+    # Adaptive boost — real feedback, computed from data already in hand
+    # ------------------------------------------------------------------
+
+    def _update_adaptive_boost(self):
+        """Must be called with self._lock held. Returns the current boost
+        (0..ADAPT_GAIN) to add on top of the sine envelope."""
+        total_depth = sum(len(f.queue) for f in self.flows.values())
+        depth_pressure = total_depth / self._max_queue_total  # 0..1
+
+        total_drops = sum(f.dropped for f in self.flows.values())
+        drop_delta = total_drops - self._last_total_drops
+        self._last_total_drops = total_drops
+        drop_pressure = 1.0 if drop_delta > 0 else 0.0  # any drop this tick is a hard signal
+
+        congestion_signal = min(1.0, depth_pressure + drop_pressure)
+        self._congestion_ewma += EWMA_ALPHA * (congestion_signal - self._congestion_ewma)
+
+        return ADAPT_GAIN * self._congestion_ewma
 
     # ------------------------------------------------------------------
     # Drain loop — runs in dedicated thread at TICK_HZ
@@ -106,8 +143,13 @@ class WavePacer:
             last_tick = now
 
             with self._lock:
-                # Quartz sine envelope: 0.8–1.0 × BASE_RATE over PERIOD_S
-                envelope = 0.8 + 0.2 * math.sin(2 * math.pi * now / PERIOD_S)
+                # Quartz sine envelope (0.8-1.0) plus a bounded adaptive
+                # boost from real queue-depth/drop feedback - the boost can
+                # only push the ceiling up under genuine congestion, never
+                # push the floor down.
+                sine_envelope = 0.8 + 0.2 * math.sin(2 * math.pi * now / PERIOD_S)
+                boost = self._update_adaptive_boost()
+                envelope = min(ENVELOPE_CEIL, sine_envelope + boost)
                 budget   = int((BASE_RATE_BPS * envelope / 8) * dt)
 
                 # Refill each flow's rate_bps token bucket. This enforces
@@ -151,7 +193,8 @@ class WavePacer:
                     next_status_at = now + 1.0
                     depth = {n: len(f.queue) for n, f in self.flows.items() if f.queue}
                     drops = {n: f.dropped for n, f in self.flows.items() if f.dropped}
-                    print(f"[wave-pacer] q_bytes={self._q_bytes()} depth={depth or '{}'} "
+                    print(f"[wave-pacer] envelope={envelope:.3f} (sine={sine_envelope:.3f} "
+                          f"boost={boost:.3f}) q_bytes={self._q_bytes()} depth={depth or '{}'} "
                           f"drops={drops or '{}'} "
                           f"sent={ {n: f.bytes_sent for n, f in self.flows.items()} }",
                           flush=True)
@@ -170,7 +213,8 @@ class WavePacer:
         threading.Thread(target=self.nfq.run, daemon=True, name="nfq-recv").start()
         print(f"[wave-pacer] queue={QUEUE_NUM}  "
               f"rate={BASE_RATE_BPS // 1_000_000} Mbps  tick={TICK_HZ} Hz  "
-              f"period={PERIOD_S}s  envelope=0.8–1.0",
+              f"period={PERIOD_S}s  envelope={ENVELOPE_FLOOR}-{ENVELOPE_CEIL:.2f} "
+              f"(sine 0.8-1.0 + adaptive boost up to {ADAPT_GAIN})",
               flush=True)
         self._stop.wait()           # main thread blocks here until signal
         self.running = False
