@@ -53,7 +53,12 @@ def main():
     sel.register(chal_sock, selectors.EVENT_READ, data="chal")
 
     tick_buf = collections.deque(maxlen=TICK_BUF)
-    pending  = {}   # (sid, target_tick) → (nonce, chal_ip, resp_port, expires)
+    # (sid, target_tick) -> list of (nonce, chal_ip, resp_port, expires).
+    # A list, not a single tuple: two concurrent challengers can legitimately
+    # target the same (sid, tick), and a single-slot dict would let the
+    # second registration silently overwrite the first, starving one
+    # challenger of any response at all (found live 2026-08-09).
+    pending  = {}
 
     print(f"[prover] AP:{AP_PORT}  chal:{PA_CHAL_PORT}  buf={TICK_BUF}", flush=True)
 
@@ -73,15 +78,16 @@ def main():
 
                 pkey = (sid, tick)
                 if pkey in pending:
-                    nonce, chal_ip, resp_port, expires = pending.pop(pkey)
-                    if time.time() < expires:
-                        digest   = make_hash(nonce, tick, theta, pd)
-                        resp_pkt = struct.pack(RESP_FMT, RESP_MAGIC, nonce, digest)
-                        resp_out.sendto(resp_pkt, (chal_ip, resp_port))
-                        print(f"[prover] responded  sid={sid}  tick={tick}  θ={theta:.4f}  pd={pd:.4f}"
-                              f"  → {chal_ip}:{resp_port}", flush=True)
-                    else:
-                        print(f"[prover] expired  sid={sid}  tick={tick}", flush=True)
+                    now = time.time()
+                    for nonce, chal_ip, resp_port, expires in pending.pop(pkey):
+                        if now < expires:
+                            digest   = make_hash(nonce, tick, theta, pd)
+                            resp_pkt = struct.pack(RESP_FMT, RESP_MAGIC, nonce, digest)
+                            resp_out.sendto(resp_pkt, (chal_ip, resp_port))
+                            print(f"[prover] responded  sid={sid}  tick={tick}  θ={theta:.4f}  pd={pd:.4f}"
+                                  f"  → {chal_ip}:{resp_port}", flush=True)
+                        else:
+                            print(f"[prover] expired  sid={sid}  tick={tick}  → {chal_ip}:{resp_port}", flush=True)
 
             elif tag == "chal":
                 data, addr = chal_sock.recvfrom(64)
@@ -103,10 +109,12 @@ def main():
                               f"  θ={theta:.4f}  pd={pd:.4f}  → {chal_ip}:{resp_port}", flush=True)
                         break
                 else:
-                    pending[(req_sid, target_tick)] = (nonce, chal_ip, resp_port, time.time() + 5.0)
+                    pending.setdefault((req_sid, target_tick), []).append(
+                        (nonce, chal_ip, resp_port, time.time() + 5.0))
 
         now = time.time()
-        pending = {k: v for k, v in pending.items() if v[3] > now}
+        pending = {k: [w for w in v if w[3] > now] for k, v in pending.items()}
+        pending = {k: v for k, v in pending.items() if v}
 
 
 if __name__ == "__main__":

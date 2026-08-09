@@ -221,10 +221,37 @@ no raw sockets:
      `WITHDRAW` before the beacon's own `PEER_STALE_S` cliff, then
      fully recovered to `CALM` once the link was restored.
 
+6. **Concurrent challenges — two real bugs found and fixed
+   (2026-08-09).** Ran two `phase_auth.py` challengers simultaneously
+   against one prover.
+   - **Fixed response port collision.** `resp_sock` bound the
+     hardcoded `PA_RESP_PORT=7452` with only `SO_REUSEADDR`. Two
+     challengers on the same host collide silently — Linux delivers
+     unicast traffic on a shared bound port to whichever socket bound
+     *last*, not both, so the other challenger's response never
+     arrives at all. Reproduced live: one challenger `PASS`ed, the
+     other timed out to `FAIL` even though the prover answered both
+     correctly. Fixed: each challenger now binds an ephemeral,
+     OS-assigned port and puts the real port number in the challenge
+     packet — the wire format already had a `resp_port` field for
+     this, it just wasn't being used per-challenge.
+   - **`pending` dict overwrite on tick collision.** With the port fix
+     alone, a second bug surfaced: when both challengers happened to
+     lock onto the exact same `(sid, target_tick)` (common — both
+     processes read the same live stream), `phase_auth_prover.py`'s
+     `pending` dict, keyed by `(sid, target_tick)` holding a single
+     tuple, let the second registration silently overwrite the first.
+     Only one challenger ever got a response; the other timed out with
+     no explanation. Fixed: `pending` now holds a list per
+     `(sid, tick)`, and every waiter gets answered when the tick
+     arrives.
+   - Retest: 5 rounds of simultaneous challenger pairs, 4 of which
+     landed on the exact same `(sid, tick)`, all 10/10 `PASS`.
+
 Not yet tested: reordering (vs. pure loss) on either multicast group,
-prover restart mid-window, clock step during a challenge, concurrent
-challenges. Point 2 of [Production gaps](#production-gaps) below still
-stands — five fault scenarios covered so far, not a systematic matrix.
+prover restart mid-window, clock step during a challenge. Point 2 of
+[Production gaps](#production-gaps) below still stands — six fault
+scenarios covered so far, not a systematic matrix.
 
 ## Wire formats
 

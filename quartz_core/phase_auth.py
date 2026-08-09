@@ -36,7 +36,7 @@ AP_FMT   = ">HBBIfffffHQ"; AP_SIZE = struct.calcsize(AP_FMT); AP_MAGIC = 0x4158
 
 # Phase-auth channels
 PA_GRP       = "239.0.0.5"; PA_CHAL_PORT = 7451
-PA_RESP_PORT = 7452
+# Response port is ephemeral per-challenger, not fixed -- see run_challenge()
 
 # Wire formats
 CHAL_FMT   = "!H16sIHB";  CHAL_MAGIC = 0x5043; CHAL_SIZE = struct.calcsize("!H16sIHB")
@@ -71,8 +71,15 @@ def run_challenge():
     # Sockets
     ap_sock   = _mcast_in(AP_GRP, AP_PORT)
     resp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    resp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    resp_sock.bind(("", PA_RESP_PORT))
+    # Ephemeral port, not a fixed one, so two challengers running
+    # concurrently on the same host each own a distinct response channel.
+    # A shared fixed port with only SO_REUSEADDR doesn't fan a unicast
+    # response out to both listeners -- Linux delivers it to whichever
+    # socket bound last, silently starving the other (found live 2026-08-09:
+    # two simultaneous challengers, one got PASS, the other timed out to
+    # FAIL despite the prover answering both correctly).
+    resp_sock.bind(("", 0))
+    resp_port = resp_sock.getsockname()[1]
     resp_sock.setblocking(False)
 
     chal_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -105,7 +112,7 @@ def run_challenge():
     target_tick = current_tick + CHALLENGE_AHEAD
     nonce       = os.urandom(16)
 
-    chal_pkt = struct.pack(CHAL_FMT, CHAL_MAGIC, nonce, target_tick, PA_RESP_PORT, locked_sid)
+    chal_pkt = struct.pack(CHAL_FMT, CHAL_MAGIC, nonce, target_tick, resp_port, locked_sid)
     chal_out.sendto(chal_pkt, (PA_GRP, PA_CHAL_PORT))
     print(f"[phase_auth] challenge  nonce={nonce.hex()[:12]}…  sid={locked_sid}  target_tick={target_tick}", flush=True)
 
