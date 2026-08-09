@@ -109,6 +109,41 @@ receiver binds only to the WireGuard-internal address — the "no raw
 internet exposure" pattern used everywhere else in this project, not a
 new trust model.
 
-`--execute` has not been exercised for a real `restart_wg_easy` yet —
-the ack/retry work above was validated with a harmless test string,
-not the live restart path.
+### Real end-to-end run (2026-08-09)
+
+`--execute` exercised against the live `restart_wg_easy` path, not just
+a harmless test string: phase-auth gate `PASS` → `restart_wg_easy`
+decoded correctly on the first attempt (120 bits, 2880 ticks) → ack
+`CONFIRMED` → `truthd` `ALLOW TIER_FULL` → `docker restart wg-easy`
+executed (`exit=0`, `stdout='wg-easy'`) → fresh WireGuard handshake
+within 5s. Full chain — physical-presence attestation → timing-encoded
+command → signed verification → distributed trust-tier gate → real
+execution — worked end to end across three real machines and a WAN hop.
+
+### Result reporting
+
+Considered sending command output back over the *same jitter/timing
+channel* (full duplex). Decided against it: the timing channel's only
+purpose is proving physical presence, a property only the sender needs
+— EC2 has no oscillator to attest to on the reply leg, so encoding the
+response as jitter would just be slow (many seconds for real output)
+for no security benefit over the already-signed, already-fast ack
+channel. Instead, `jitter_wan_rx.py` now sends a second, distinct
+signed report (`RESULT_PORT=7413`, separate from the transmission ack
+on `ACK_PORT=7412` so it can't be confused with it or with a retry) after
+executing, containing the actual `exit`/`stdout`/`stderr`. Reuses
+`ec2_intent_common.pack_response` again, no new crypto.
+`jitter_wan_tx.py` waits for it (`RESULT_TIMEOUT_S=15.0`) after a
+confirmed send and prints it — no SSH needed to see the outcome.
+Verified live: `'EC2 result: unknown intent 'hello ec2 test''` arrived
+automatically for a non-intent test string.
+
+### Operational note
+
+`jitter_wan_rx.py` is single-shot — it handles exactly one burst then
+exits, not a persistent daemon. It needs restarting on EC2 before each
+send. Found by testing a retry scenario: attempt 1's mismatch consumed
+the one running instance, so attempts 2/3 had nothing listening and
+correctly (if confusingly, until traced) timed out. Not fixed into a
+loop yet — worth doing if this becomes more than an occasional manual
+trigger.

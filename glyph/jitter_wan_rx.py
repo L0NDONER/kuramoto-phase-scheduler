@@ -41,8 +41,9 @@ BIND_IP = "10.8.0.1"   # WG-internal only
 PORT    = 7410
 MAGIC   = 0x4A57
 
-MINT_WG_IP = "10.8.0.4"   # Mint's wg-irssi address
-ACK_PORT   = 7412
+MINT_WG_IP  = "10.8.0.4"   # Mint's wg-irssi address
+ACK_PORT    = 7412         # transmission-confirmation ack (decoded text echo)
+RESULT_PORT = 7413         # post-execution result report (only in --execute mode)
 
 TICKS_PER_BIT = 24
 THRESH        = 0.010   # 8ms -- must match jitter_wan_tx.py's JITTER_SIGMA margin
@@ -100,6 +101,25 @@ def truthd_check(verb):
         return f"DENY UNREACHABLE({e})"
 
 
+def send_signed(nonce, detail, port):
+    """Sends a signed pack_response to Mint on the given port. Used for
+    both the transmission-confirmation ack (ACK_PORT) and the separate
+    post-execution result report (RESULT_PORT) -- same signing, same
+    key, deliberately not the same packet: the tx side's retry logic
+    depends on the ack always being exactly the decoded text, so exec
+    results go out as a second, distinct report instead of overloading
+    that field."""
+    try:
+        key = load_key()
+        pkt = pack_response(nonce, DONE_OK, detail, key)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(pkt, (MINT_WG_IP, port))
+        sock.close()
+        print(f"[jitter-wan-rx] sent -> {MINT_WG_IP}:{port}: {detail!r}", flush=True)
+    except OSError as e:
+        print(f"[jitter-wan-rx] send to port {port} failed: {e}", flush=True)
+
+
 def mcast_in():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -154,15 +174,7 @@ def main():
     text = bits_to_text(bits)
     print(f"[jitter-wan-rx] decoded: {text!r}", flush=True)
 
-    try:
-        key = load_key()
-        ack = pack_response(0, DONE_OK, text, key)
-        ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        ack_sock.sendto(ack, (MINT_WG_IP, ACK_PORT))
-        ack_sock.close()
-        print(f"[jitter-wan-rx] ack sent -> {MINT_WG_IP}:{ACK_PORT}", flush=True)
-    except OSError as e:
-        print(f"[jitter-wan-rx] ack send failed: {e}", flush=True)
+    send_signed(0, text, ACK_PORT)
 
     if expect is not None:
         expected_bits = text_to_bits(expect)
@@ -177,17 +189,21 @@ def main():
     intent = text.strip()
     if intent not in INTENTS:
         print(f"[jitter-wan-rx] unknown intent {intent!r}, not executing", flush=True)
+        send_signed(1, f"unknown intent {intent!r}", RESULT_PORT)
         return
 
     resp = truthd_check("EC2_SELF")
     print(f"[jitter-wan-rx] truthd: {resp}", flush=True)
     if not resp.startswith("ALLOW"):
         print(f"[jitter-wan-rx] GATE DENIED, not executing", flush=True)
+        send_signed(1, f"GATE DENIED: {resp}", RESULT_PORT)
         return
 
     result = subprocess.run(INTENTS[intent], capture_output=True, text=True)
-    print(f"[jitter-wan-rx] EXECUTED {intent}: exit={result.returncode} "
-          f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}", flush=True)
+    summary = (f"exit={result.returncode} stdout={result.stdout.strip()!r} "
+               f"stderr={result.stderr.strip()!r}")
+    print(f"[jitter-wan-rx] EXECUTED {intent}: {summary}", flush=True)
+    send_signed(1, summary, RESULT_PORT)
 
 
 if __name__ == "__main__":

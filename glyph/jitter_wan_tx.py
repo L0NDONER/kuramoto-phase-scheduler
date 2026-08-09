@@ -32,7 +32,9 @@ PORT      = 7410
 MAGIC     = 0x4A57  # "JW"
 
 ACK_PORT       = 7412
+RESULT_PORT    = 7413
 ACK_TIMEOUT_S  = 5.0     # generous: WAN RTT (~161ms) + decode processing
+RESULT_TIMEOUT_S = 15.0  # generous: EC2 has to run the command before reporting
 MAX_ATTEMPTS   = 3
 
 TICK_S        = 0.01           # 100Hz cadence, same as the LAN version
@@ -99,6 +101,30 @@ def wait_for_ack(key):
     return detail
 
 
+def wait_for_result(key):
+    """Waits (best-effort) for EC2's post-execution result report on
+    RESULT_PORT. Distinct from the transmission ack -- this only arrives
+    if the receiver is running with --execute, so its absence is not a
+    failure, just "nothing to report" (e.g. decode-only mode)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", RESULT_PORT))
+    sock.settimeout(RESULT_TIMEOUT_S)
+    try:
+        data, addr = sock.recvfrom(512)
+    except socket.timeout:
+        print("[jitter-wan-tx] no execution result reported "
+              "(receiver may not be in --execute mode)", flush=True)
+        return
+    finally:
+        sock.close()
+    try:
+        status, detail, _nonce = unpack_response(data, key)
+    except ValueError as e:
+        print(f"[jitter-wan-tx] bad result report: {e}", flush=True)
+        return
+    print(f"[jitter-wan-tx] EC2 result: {detail}", flush=True)
+
+
 def main():
     text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "hello ec2"
     key = load_key()
@@ -115,6 +141,7 @@ def main():
 
         if acked == text:
             print(f"[jitter-wan-tx] CONFIRMED — EC2's ack matches exactly (attempt {attempt})", flush=True)
+            wait_for_result(key)
             return True
         elif acked is not None:
             print(f"[jitter-wan-tx] MISMATCH — sent {text!r}, EC2 decoded {acked!r}, retrying", flush=True)
