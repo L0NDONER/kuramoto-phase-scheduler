@@ -178,11 +178,44 @@ no raw sockets:
    buffer on `(sid, tick)` instead of `tick` alone. Retest: 8/8 PASS,
    alternating cleanly across both live sids.
 
-Not yet tested: packet loss/reordering on the AxisPulse multicast
-itself, prover restart mid-window, clock step during a challenge,
-concurrent challenges. Point 2 of [Production
-gaps](#production-gaps) below still stands — three fault scenarios
-found and fixed so far, not a systematic matrix.
+4. **Unbounded initial lock wait — found and fixed (2026-08-09).**
+   `run_challenge()`'s "wait for AxisPulse lock" loop had no overall
+   deadline, only a repeating 2s `select()` poll — with the carrier
+   fully down it blocked forever instead of failing. Found while
+   testing 100% packet loss on `239.0.0.5`... on the wrong port (see
+   below). Fixed: `LOCK_TIMEOUT_S = 10.0` bounds it now. Verified:
+   fails cleanly at ~10.03s with no carrier running at all.
+5. **Packet loss on the real peer link (`239.0.0.1:7400`, RAW) —
+   tested, one real blind spot found.** An earlier pass injected loss
+   on `239.0.0.2:7404` (AxisPulse, the *output* stream to consumers)
+   and wrongly concluded the beacon was robust to loss — that port
+   never touches beacon-to-beacon coupling, so nothing was actually
+   being tested on the peer-lock path. Re-run against the actual RAW
+   port with `iptables -m statistic --mode random`, scoped to
+   `udp dport 7400 -d 239.0.0.1` only:
+   - 30% loss: stayed `locked=True`, `dev` rose ~250x (0.003–0.013 vs
+     baseline ~0.00003).
+   - 70% loss: still `locked=True`, `dev` 0.009–0.025.
+   - 100% loss: `pd` drifted wildly for the full `PEER_STALE_S` window
+     (`+1.77` → `+2.86` → `-2.33` across three ticks, since the peer's
+     `theta` is frozen while ours keeps advancing) before correctly
+     dropping to `locked=False no peers` at the 3s mark. Removing the
+     rule re-locked immediately at `dev=0.00006`, back to baseline.
+   - **Blind spot:** `dev` is the EMA of *frame-to-frame* `pd` change,
+     and a frozen peer produces smooth, predictable drift rather than
+     noise — so `dev` stayed flat (~0.011) for the entire 3-second
+     window where `pd` itself was meaningless, right up until the peer
+     was dropped. Anything treating `dev` as a live trust/health signal
+     has a blind window exactly where a dying peer matters most. Not
+     fixed yet — would need a second signal (e.g. time-since-last-RAW-
+     packet-from-this-peer) alongside `dev`, not a `dev` threshold
+     change, since the metric is measuring the wrong thing for this
+     failure mode.
+
+Not yet tested: reordering (vs. pure loss) on either multicast group,
+prover restart mid-window, clock step during a challenge, concurrent
+challenges. Point 2 of [Production gaps](#production-gaps) below still
+stands — five fault scenarios covered so far, not a systematic matrix.
 
 ## Wire formats
 

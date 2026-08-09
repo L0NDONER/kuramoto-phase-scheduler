@@ -44,6 +44,7 @@ RESP_FMT   = "!H16s32s";  RESP_MAGIC = 0x5052; RESP_SIZE = struct.calcsize("!H16
 
 CHALLENGE_AHEAD = 30    # ticks ahead to set target_tick (~300ms at 100 tps, axis_pulse.AP_TICK_S)
 WINDOW_S        = 3.0   # seconds to wait for prover response after target_tick
+LOCK_TIMEOUT_S  = 10.0  # seconds to wait for an initial AxisPulse lock before failing
 
 
 def make_hash(nonce, tick, theta, pd):
@@ -86,7 +87,8 @@ def run_challenge():
     print("[phase_auth] waiting for AxisPulse lock...", flush=True)
     current_tick = None
     locked_sid   = None
-    while current_tick is None:
+    lock_deadline = time.time() + LOCK_TIMEOUT_S
+    while current_tick is None and time.time() < lock_deadline:
         for key, _ in sel.select(timeout=2.0):
             if key.data == "ap":
                 data, _ = ap_sock.recvfrom(64)
@@ -95,6 +97,10 @@ def run_challenge():
                     if f[0] == AP_MAGIC and f[2]:
                         current_tick = f[3]
                         locked_sid   = f[1]
+
+    if current_tick is None:
+        print(f"[phase_auth] FAIL — no AxisPulse lock within {LOCK_TIMEOUT_S:.0f}s", flush=True)
+        return False
 
     target_tick = current_tick + CHALLENGE_AHEAD
     nonce       = os.urandom(16)
