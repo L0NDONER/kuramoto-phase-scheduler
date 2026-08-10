@@ -19,7 +19,9 @@ import time
 from cpu_telemetry import CpuTelemetry
 from layer0_oscillator import (Layer0Node, gain_from_deviation,
                                 integrate_interval, order_parameter)
+from layer0_report import mcast_out, send_report
 
+NODE_NAME = "pi2"
 TARGET_LOAD_FRAC = 0.50   # stand-in policy: "keep each core around 50% load"
 REPORT_INTERVAL_S = 0.5
 TOTAL_DURATION_S = 60.0
@@ -34,6 +36,7 @@ def main():
     time.sleep(REPORT_INTERVAL_S)
 
     nodes = [Layer0Node(i) for i in range(telem.n_cores)]
+    report_sock = mcast_out()
 
     n_intervals = max(1, int(TOTAL_DURATION_S / REPORT_INTERVAL_S))
     for tick in range(n_intervals):
@@ -43,6 +46,7 @@ def main():
 
         integrate_interval(nodes, gains, REPORT_INTERVAL_S)
         r, psi = order_parameter(nodes)
+        send_report(report_sock, NODE_NAME, r, psi)
 
         parts = " ".join(
             f"core{s.core if s else i}: load={l*100:4.1f}% "
