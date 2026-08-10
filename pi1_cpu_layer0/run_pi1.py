@@ -1,11 +1,11 @@
-"""run_pi2.py — Layer 0 prototype for Pi2's CPU, one oscillator per core.
+"""run_pi1.py — Layer 0 prototype for Pi1's CPU, one oscillator per core.
 
 Same shape as gpu_layer0/run_kaggle.py: sample real telemetry once per
 REPORT_INTERVAL_S, derive a per-core coupling gain from how far that
 core's load sits from TARGET_LOAD_FRAC, RK4-integrate, report the order
 parameter plus the raw telemetry that drove it.
 
-N=4 here (Pi2's real core count) is a meaningfully better swarm size
+N=4 here (Pi1's real core count) is a meaningfully better swarm size
 than gpu_layer0's N=2 -- still below the ~10 threshold where r becomes
 a fully trustworthy coherence statistic, but closer, and multi-core
 rather than dual-GPU makes the "many independent oscillators" framing
@@ -13,6 +13,12 @@ less of a stretch.
 
 First cpu_telemetry sample has no prior state to diff against (returns
 None for every core) -- discarded here rather than treated as real data.
+
+Unlike Pi2, Pi1 already runs power_consensus_pi.py (the 10-arm DVFS
+swarm), which actively WRITES scaling_setspeed under the userspace
+governor. This module only ever READS /proc/stat and scaling_cur_freq
+-- no conflict, it's a passive observer layered on top of an actively-
+controlled system, not a second thing fighting for the same actuator.
 """
 import sys
 import time
@@ -22,7 +28,7 @@ from layer0_oscillator import (Layer0Node, gain_from_deviation,
                                 integrate_interval, order_parameter)
 from layer0_report import mcast_out, send_report
 
-NODE_NAME = "pi2"
+NODE_NAME = "pi1"
 TARGET_LOAD_FRAC = 0.50   # stand-in policy: "keep each core around 50% load"
 REPORT_INTERVAL_S = 0.5
 TOTAL_DURATION_S = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0

@@ -2,6 +2,7 @@
 pi2_cpu_layer0/run_pi2.py, plus broadcasting (r, psi) up to a Layer 1
 aggregator over multicast (see layer0_report.py).
 """
+import sys
 import time
 
 from cpu_telemetry import CpuTelemetry
@@ -12,7 +13,7 @@ from layer0_report import mcast_out, send_report
 NODE_NAME = "mint"
 TARGET_LOAD_FRAC = 0.50
 REPORT_INTERVAL_S = 0.5
-TOTAL_DURATION_S = 60.0
+TOTAL_DURATION_S = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
 
 
 def main():
