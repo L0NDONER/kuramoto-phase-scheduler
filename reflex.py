@@ -187,7 +187,7 @@ while True:
                                               go(RECOVER)
 
     elif state == PARK:
-        if not hot and temlum < RECOVER_TEMP: go(RECOVER)
+        if not hot and temlum_ema < RECOVER_TEMP: go(RECOVER)
 
     elif state == RECOVER:
         if hot:                               go(PARK)
