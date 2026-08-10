@@ -41,7 +41,7 @@ import time
 import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from pi_intent_common import load_key, pack, unpack_response, DONE_OK, DONE_FAIL
+from pi_intent_common import load_key, pack, unpack_response, DONE_OK, DONE_FAIL, REJECTED
 
 WG_IFACE = "wg0"
 WG_IFACES = os.environ.get("WATCHDOG_WG_IFACES", "wg0,wg1").split(",")
@@ -97,6 +97,12 @@ def wg_handshake_age(iface=WG_IFACE):
 
 
 def _send_intent(intent, timeout=HEARTBEAT_TIMEOUT_S):
+    """Returns (ok, detail) -- detail is the response's own text on
+    DONE_OK/DONE_FAIL/REJECTED (e.g. REJECTED's is "gate: DENY
+    TIER_LOCAL_TRIAD", see pi_intent_listener.py's _run_at), or a fixed
+    string on timeout. Callers that only care about pass/fail can just
+    use the first element; escalate_reboot() needs the detail to tell a
+    gate denial apart from the listener being genuinely unreachable."""
     key = load_key()
     nonce = int.from_bytes(os.urandom(8), "big")
     pkt = pack(intent, time.time() + 1, nonce, key)
@@ -110,7 +116,7 @@ def _send_intent(intent, timeout=HEARTBEAT_TIMEOUT_S):
             try:
                 data, _ = sock.recvfrom(512)
             except socket.timeout:
-                return False
+                return False, "timeout"
             try:
                 status, detail, resp_nonce = unpack_response(data, key)
             except ValueError:
@@ -118,16 +124,17 @@ def _send_intent(intent, timeout=HEARTBEAT_TIMEOUT_S):
             if resp_nonce != nonce:
                 continue
             if status == DONE_OK:
-                return True
-            if status == DONE_FAIL:
-                return False
-        return False
+                return True, detail
+            if status in (DONE_FAIL, REJECTED):
+                return False, detail
+        return False, "timeout"
     finally:
         sock.close()
 
 
 def send_heartbeat_intent():
-    return _send_intent("uptime")
+    ok, _detail = _send_intent("uptime")
+    return ok
 
 
 def fix_wg(iface):
@@ -146,9 +153,36 @@ def fix_listener():
 
 
 def escalate_reboot():
+    # === KNOWN GAP (2026-08-10) ===
+    # Pi/Pi2 are permanently capped at TIER_LOCAL_TRIAD -- EC2_REACHABLE_PATH
+    # is only ever written by ec2_probe.py, which only runs on Mint (see
+    # truthd.c's top-of-file comment), so these hosts can never reach
+    # TIER_FULL. TRUTH_ALLOWED[TIER_LOCAL_TRIAD][LOCAL_DESTRUCTIVE] = 0
+    # (truth_manifest.h), and "reboot" is LOCAL_DESTRUCTIVE
+    # (pi_intent_listener.py's INTENT_VERB_CLASS) -- so this call is
+    # DENIED by the gate on every Pi/Pi2 invocation, unconditionally.
+    # Confirmed live 2026-08-10: `CHECK LOCAL_DESTRUCTIVE` against both
+    # hosts' truthd returns "DENY TIER_LOCAL_TRIAD" at rest.
+    # Currently a latent gap, not an active outage: truthd has denied
+    # zero escalations since it went live (2026-08-08 14:22) because
+    # local fixes (fix_wg/fix_listener) have been sufficient every time
+    # so far. But if a Pi ever gets wedged badly enough to actually need
+    # this path, the reboot silently won't happen -- the log line below
+    # is the only signal, watch for it.
+    # TODO: either a dedicated verb class for last-resort reboot-via-
+    # substrate that's permitted at TIER_LOCAL_TRIAD, or re-evaluate
+    # whether LOCAL_DESTRUCTIVE itself should be allowed at that tier.
+    # === END GAP ===
     print("[watchdog] local fixes exhausted -- sending reboot via substrate",
           flush=True)
-    _send_intent("reboot", timeout=3)
+    ok, detail = _send_intent("reboot", timeout=3)
+    if not ok and detail.startswith("gate:"):
+        print(f"[watchdog] REBOOT ESCALATION BLOCKED BY GATE ({detail}) -- "
+              f"local fixes exhausted and the fallback reboot was denied. "
+              f"Manual intervention needed if this recurs.", flush=True)
+    elif not ok:
+        print(f"[watchdog] reboot intent not confirmed ({detail}) -- may "
+              f"still have gone through if the ACK itself was lost", flush=True)
 
 
 def main():
