@@ -83,8 +83,9 @@ def launch_remote(name, host, port, key_path, cmd, cwd):
 
 
 def main():
-    scratch = "/tmp/claude-1000/-home-martin-claude/3b4a0985-4c2a-4ed7-afb6-46d1827ec208/scratchpad"
     fractal_dir = os.path.dirname(__file__)
+    scratch = os.path.join(fractal_dir, "logs")
+    os.makedirs(scratch, exist_ok=True)
     mint_dir = os.path.join(fractal_dir, "..", "mint_cpu_layer0")
 
     print(f"[run_all] launching aggregator (local)", flush=True)
