@@ -106,3 +106,48 @@ def order_parameter(nodes):
         return 0.0, 0.0
     z = sum(cmath.exp(1j * n.theta) for n in nodes) / len(nodes)
     return abs(z), cmath.phase(z)
+
+
+# A node's own tracking error against the fixed reference (theta=0) that
+# still counts as "coherent enough to report" -- widened from the pi/4
+# "holding" boundary to pi/2, market_layer0/psi_bands.py's "marginal"
+# boundary (the actual unlock point: sin(err)=omega/k stops having a
+# solution past this). So "marginal" nodes -- lock real but thin margin --
+# still get counted; only "unanchored" nodes (past the point where a
+# stable lock could even exist) get excluded. A node beyond this is
+# pruned from order_parameter_pruned()'s average, not from its own
+# forcing -- see that function's docstring for why those are different
+# things.
+PRUNE_ERR_BAND = math.pi / 2
+
+
+def node_tracking_err(node):
+    """This node's own phase error against the fixed reference theta=0,
+    wrapped to (-pi, pi]. Same formula layer1_oscillator.py uses against
+    a moving target, specialized to Layer 0's target=0."""
+    return ((node.theta + math.pi) % (2 * math.pi)) - math.pi
+
+
+def coherent_nodes(nodes):
+    """Nodes whose own tracking_err is still inside PRUNE_ERR_BAND.
+    Pruning here never touches a node's own gain/forcing -- an excluded
+    node keeps being pulled back toward the reference exactly as before
+    (see gain_from_deviation/step_rk4), it's just left out of what gets
+    reported upward until it's back in-band. Reducing a straying node's
+    own gain instead would weaken its correction and likely make it drift
+    further, not recover faster -- that's not what this does."""
+    return [n for n in nodes if abs(node_tracking_err(n)) < PRUNE_ERR_BAND]
+
+
+def order_parameter_pruned(nodes):
+    """Same order_parameter() math, computed over coherent_nodes(nodes)
+    instead of the full ensemble -- a handful of nodes currently far off
+    the reference (marginal/unanchored, not just noisy) would otherwise
+    corrupt the reported r/psi into looking more scattered than the
+    coherent majority actually is. Falls back to the full ensemble if
+    pruning would leave nothing to report, same empty-input behavior as
+    order_parameter(). Returns (r, psi, coherent) so callers can see which
+    nodes were actually counted."""
+    coherent = coherent_nodes(nodes)
+    r, psi = order_parameter(coherent if coherent else nodes)
+    return r, psi, coherent
