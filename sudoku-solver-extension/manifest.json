@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Sudoku Solver",
+  "version": "0.2.0",
+  "description": "Auto-detects and solves sudoku grids on any website.",
+  "permissions": ["activeTab", "scripting", "webNavigation"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["solver.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
