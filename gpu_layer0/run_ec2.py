@@ -1,34 +1,29 @@
-"""run_kaggle.py — Layer 0 prototype runner. Copy into a Kaggle notebook
-cell (after `pip install pynvml` in the cell before), or run locally on
-any machine with an NVML-visible GPU.
-
-Samples real GPU telemetry once per REPORT_INTERVAL_S, derives a per-GPU
-coupling gain from how far each GPU's power draw sits from TARGET_POWER_FRAC
-of its power limit, RK4-integrates each GPU's phase for that interval, and
-reports the order parameter (r, psi) plus the raw telemetry that drove it.
-
-See README.md for what this does and doesn't prove -- mechanics on real
-hardware, not real swarm consensus (too few GPUs on a Kaggle session for
-r to be a meaningful coherence statistic).
+"""run_ec2.py — same as run_kaggle.py, plus broadcasting (r, psi) up to
+a Layer 1 aggregator / reflex consumer over multicast (layer0_report.py),
+node name "gpu". Real hardware, real root access -- unlike Kaggle, this
+box's reflex consumer can actually act on what it observes.
 """
 import time
 
 from pynvml_telemetry import GpuTelemetry
 from layer0_oscillator import (Layer0Node, gain_from_deviation,
                                 integrate_interval, order_parameter)
+from layer0_report import mcast_out, send_report
 
-TARGET_POWER_FRAC = 0.70   # stand-in policy: "run each GPU at 70% of its power budget"
+NODE_NAME = "gpu"
+TARGET_POWER_FRAC = 0.70
 REPORT_INTERVAL_S = 0.5
-TOTAL_DURATION_S = 60.0
+TOTAL_DURATION_S = 90.0
 
 
 def main():
     telem = GpuTelemetry()
-    print(f"[layer0] {telem.n_gpus} NVML-visible GPU(s):")
+    print(f"[layer0-{NODE_NAME}] {telem.n_gpus} NVML-visible GPU(s):")
     for s in telem.sample_all():
         print(f"  [{s.index}] {s.name}  power_limit={s.power_limit_w:.0f}W")
 
     nodes = [Layer0Node(i) for i in range(telem.n_gpus)]
+    report_sock = mcast_out()
 
     n_intervals = max(1, int(TOTAL_DURATION_S / REPORT_INTERVAL_S))
     for tick in range(n_intervals):
@@ -40,6 +35,7 @@ def main():
 
         integrate_interval(nodes, gains, REPORT_INTERVAL_S)
         r, psi = order_parameter(nodes)
+        send_report(report_sock, NODE_NAME, r, psi)
 
         parts = " ".join(
             f"gpu{s.index}: {s.power_w:5.1f}W/{s.power_limit_w:.0f}W "
@@ -49,13 +45,11 @@ def main():
         print(f"[{tick * REPORT_INTERVAL_S:6.1f}s] r={r:.3f} psi={psi:+.3f}  {parts}",
               flush=True)
 
-        # Real elapsed-time pacing, not implicit -- confirmed live 2026-08-11:
-        # on real EC2 hardware NVML calls are fast enough that this loop with
-        # no explicit sleep blew through all 180 "90s" of intervals in about
-        # 4 real seconds. Kaggle's slower NVML latency happened to pace this
-        # accidentally close to REPORT_INTERVAL_S, which is why it looked
-        # correct there and wasn't caught until run_ec2.py hit real hardware
-        # with faster NVML round-trips.
+        # Real elapsed-time pacing -- see run_kaggle.py's comment: relying on
+        # NVML call latency to accidentally pace this is not portable, this
+        # exact loop blew through 90 "seconds" of intervals in ~4 real
+        # seconds on this box's faster NVML round-trip (confirmed live
+        # 2026-08-11).
         elapsed = time.time() - tick_start
         remaining = REPORT_INTERVAL_S - elapsed
         if remaining > 0:

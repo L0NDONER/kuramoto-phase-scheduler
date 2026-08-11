@@ -23,8 +23,12 @@ FMT = "!HBff"    # magic, node_id, r, psi
 SIZE = struct.calcsize(FMT)
 
 # Fixed small registry, not a general discovery protocol -- matches this
-# session's node count (2-3 real machines), extend by hand if more show up.
-NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4}
+# session's node count (real machines + one aggregate), extend by hand if
+# more show up. "layer1" is Layer 1 itself broadcasting r1/psi1 back onto
+# the same wire format/port a Layer 0 node uses -- the recursive structure
+# continuing one level up, not a special case: whatever subscribes to a
+# Layer 0 report can subscribe to Layer 1's the same way.
+NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4, "layer1": 5}
 NODE_NAMES = {v: k for k, v in NODE_IDS.items()}
 
 
