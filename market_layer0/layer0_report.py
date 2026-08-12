@@ -43,7 +43,7 @@ SIZE = struct.calcsize(FMT)
 # the same wire format/port a Layer 0 node uses -- the recursive structure
 # continuing one level up, not a special case: whatever subscribes to a
 # Layer 0 report can subscribe to Layer 1's the same way.
-NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4, "layer1": 5, "market": 6}
+NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4, "layer1": 5, "market": 6, "layer2": 7}
 NODE_NAMES = {v: k for k, v in NODE_IDS.items()}
 
 

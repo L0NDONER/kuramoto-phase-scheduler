@@ -16,14 +16,15 @@ theta). Same RK4 shape, same K > omega stability/lock condition, just
 generalized to a target that moves every interval instead of sitting at
 0 forever.
 
-Coupling gain is driven by r1 (the incoming reports' coherence), not a
-telemetry deviation like Layer 0's gain_from_deviation -- when the Layer
-0 nodes agree (r1 high), Layer 1 has a real signal worth locking onto;
-when they're scattered (r1 low), gain drops toward 0 and Layer 1
-free-runs at its own omega instead of forcibly chasing a meaningless
-mean-field snapshot. Coherence gates trust in the target -- it isn't
-assumed, matching the "don't wire noise straight into a forced lock"
-caution from project_kuramoto_engineering_pitfalls.
+Coupling gain is driven by a meta-state built from three geometric
+signals (see gain_from_meta_state() below), not r1 alone -- r1 (do the
+Layer 0 sources agree?), tracking_err0 (is Layer 0 itself well-anchored
+to its own reference?), and delta_tracking_err1 (is Layer 1's own lock
+currently improving or degrading?). Layer 1 doesn't just track psi1
+anymore, it also tracks how well it's tracking, and uses that to decide
+how hard to keep trying -- purely mechanical (no learning, no gradients),
+same "don't wire noise straight into a forced lock" caution as before,
+just informed by more than one signal now.
 """
 import math
 import random
@@ -64,12 +65,44 @@ class Layer1Node:
         self.theta = (t + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)) % (2 * math.pi)
 
 
-def gain_from_coherence(r1):
-    """Layer 0 coherence -> Layer 1's coupling gain. Higher agreement
-    among Layer 0 nodes means a more trustworthy target, so gain scales
-    directly with r1 (clamped to [0,1]) instead of being constant -- see
-    module docstring."""
-    return K1_MAX * max(0.0, min(1.0, r1))
+
+# Meta-state gain: folds three geometric signals into how much Layer 1
+# trusts its own forcing, not just upstream agreement (r1) alone --
+# mechanical, no learning, same "compare trends, don't fit them" spirit
+# as the rest of this codebase.
+#
+#   - r1 (coherence_factor): do the live Layer 0 sources currently agree
+#     with each other? Same signal gain_from_coherence used alone before.
+#   - tracking_err0 (anchoring_factor): is Layer 0 itself well-anchored
+#     to ITS OWN reference (theta=0), independent of whether sources
+#     agree with each other? Two sources can agree tightly on a psi that
+#     is itself far off Layer 0's own reference -- r1 alone can't see
+#     that, this can. Same pi/2 unlock boundary layer0_oscillator.py /
+#     psi_bands.py already use elsewhere in this stack.
+#   - delta_tracking_err1 (stability_factor): is Layer 1's own tracking
+#     error currently growing (diverging) or shrinking (converging)? A
+#     growing error while already being forced reads as "the target is
+#     currently harder to track than the coupling can follow", not
+#     "push harder" -- same "don't fight incoherence by cranking gain"
+#     reasoning as order_parameter_pruned() leaving a straying node's own
+#     forcing untouched rather than weakening it. Only the growing case
+#     is penalized; a shrinking error (converging) isn't rewarded beyond
+#     what r1/tracking_err0 already grant.
+TRACKING_ERR0_UNLOCK = math.pi / 2       # same boundary as layer0_oscillator.py's PRUNE_ERR_BAND
+DIVERGENCE_DAMPING_SCALE = math.pi / 4   # delta_tracking_err1 magnitude that halves stability_factor
+
+
+def gain_from_meta_state(r1, tracking_err0, delta_tracking_err1):
+    """Replaces gain_from_coherence(r1) with a three-factor trust product
+    -- see the constants above and module docstring for what each factor
+    means and why it's mechanical, not learned. Each factor clamps to
+    [0,1] independently, so any one bad signal alone can drive gain to
+    ~0 without the others needing to agree first."""
+    coherence_factor = max(0.0, min(1.0, r1))
+    anchoring_factor = max(0.0, 1.0 - abs(tracking_err0) / TRACKING_ERR0_UNLOCK)
+    stability_factor = max(0.0, min(1.0,
+        1.0 - max(0.0, delta_tracking_err1) / DIVERGENCE_DAMPING_SCALE))
+    return K1_MAX * coherence_factor * anchoring_factor * stability_factor
 
 
 def integrate_interval(node, gain, target, interval_s, dt=DT1_S):

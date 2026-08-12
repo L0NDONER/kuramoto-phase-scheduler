@@ -1,5 +1,14 @@
-"""run_test.py — wires a real Binance trade feed into the Layer0
-oscillator loop, same shape as mint_cpu_layer0/run_local.py.
+"""run_test.py — wires a real price feed (crypto via Binance, or a US
+stock via Finnhub -- see price_feed.py) into the Layer0 oscillator loop,
+same shape as mint_cpu_layer0/run_local.py.
+
+Feed source is chosen by MARKET_FEED_SOURCE ('crypto' or 'stock', env
+var), symbol by MARKET_SYMBOL or the second CLI arg -- see price_feed.py
+for why this is a selector over two interchangeable backends rather than
+a hardcoded Binance import. Everything below this point (bars, telemetry,
+oscillator, pruning, psi bands) is completely feed-agnostic: it only ever
+sees a stream of (price) floats, never knows or cares whether they came
+from a crypto trade or an equity trade.
 
 Raw trade prints are aggregated into BAR_INTERVAL_S bars (see
 bar_feed.py) before they ever reach MarketVolTelemetry -- ingest() is
@@ -16,22 +25,28 @@ unlike per-core CPU load, there's a single feed here, not N independent
 telemetry sources.
 """
 import asyncio
+import os
 import sys
 
 from bar_feed import bar_stream
-from binance_feed import price_stream
 from layer0_oscillator import (Layer0Node, gain_from_deviation,
                                 integrate_interval, order_parameter_pruned)
 from layer0_report import mcast_out, send_report
 from market_telemetry import MarketVolTelemetry, TARGET_CALM_FRAC
+from price_feed import price_stream
 from psi_bands import psi_band
 
 NODE_NAME = "market"
-SYMBOL = sys.argv[2] if len(sys.argv) > 2 else "btcusdt"
+FEED_SOURCE = os.environ.get("MARKET_FEED_SOURCE", "crypto")
+_DEFAULT_SYMBOLS = {"crypto": "solusdt", "stock": "AAPL"}
+SYMBOL = (sys.argv[2] if len(sys.argv) > 2 else
+          os.environ.get("MARKET_SYMBOL", _DEFAULT_SYMBOLS.get(FEED_SOURCE, "solusdt")))
 N_NODES = 8
 REPORT_INTERVAL_S = 0.5
 BAR_INTERVAL_S = 1.0     # trade prints aggregated into one bar per this many seconds
-TOTAL_DURATION_S = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
+# No arg -> run forever (production default, meant for a persistent
+# service). Pass an explicit duration for a bounded test run instead.
+TOTAL_DURATION_S = float(sys.argv[1]) if len(sys.argv) > 1 else None
 CALIB_SAMPLES = 10       # sample() readings averaged into the calm baseline
 CALIB_INTERVAL_S = BAR_INTERVAL_S   # one poll per bar -- polling faster than
                                      # bars arrive would just re-read the same
@@ -80,7 +95,7 @@ async def main():
 
     async def consume():
         nonlocal last_price
-        async for price in bar_stream(price_stream(SYMBOL), BAR_INTERVAL_S):
+        async for price in bar_stream(price_stream(FEED_SOURCE, SYMBOL), BAR_INTERVAL_S):
             telem.ingest(price)
             last_price = price
 
@@ -91,8 +106,8 @@ async def main():
     nodes = [Layer0Node(i) for i in range(N_NODES)]
     report_sock = mcast_out()
 
-    n_intervals = max(1, int(TOTAL_DURATION_S / REPORT_INTERVAL_S))
-    for tick in range(n_intervals):
+    tick = 0
+    while TOTAL_DURATION_S is None or tick * REPORT_INTERVAL_S < TOTAL_DURATION_S:
         await asyncio.sleep(REPORT_INTERVAL_S)
 
         sample = telem.sample()
@@ -113,6 +128,7 @@ async def main():
               f"[{band:>10}]  price={price_str:>10}  realized_vol={vol_str}  "
               f"value_frac={value_frac:.3f}  gain={gain:7.1f}  "
               f"pruned={pruned}", flush=True)
+        tick += 1
 
     consumer.cancel()
 
