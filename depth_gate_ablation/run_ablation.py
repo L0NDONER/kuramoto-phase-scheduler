@@ -4,25 +4,36 @@ methodology (same schedule, same dynamically-calibrated target, same
 z-score analysis) -- only what changes between runs is DEPTH (how many
 levels the CPU signal passes through: Layer 0 alone, Layer 0->1, or
 Layer 0->1->2) and GATE (whether Layer 1/2's gain is the real
-gain_from_meta_state() trust product, or a FIXED constant with no
-coherence/anchoring/stability modulation at all).
+gain_from_meta_state() trust product, a FIXED constant with no
+coherence/anchoring/stability modulation at all, or RANDOM -- gain drawn
+independently each tick from the same mean/std the trust-gated version
+actually produces, but with no dependence on real coherence at all).
 
 Layer 0 always uses its own gain_from_deviation() unchanged in every
 condition -- that's not the "trust gate" under test (gain_from_meta_state
 only exists at Layer 1+), so ablating it wouldn't isolate anything; it's
 the shared, untouched input every condition receives.
 
-FIXED gain is calibrated (not guessed) from a quick pre-measurement of
-what gain_from_meta_state() actually produces during real calm baseline
-conditions, so the fixed-vs-trust comparison isolates "reacts to
-coherence" vs "doesn't react," not "high gain vs low gain" as a
-confound.
+FIXED and RANDOM gain are both calibrated (not guessed) from a quick
+pre-measurement of what gain_from_meta_state() actually produces during
+real calm baseline conditions. FIXED alone left a real confound
+unresolved: gain_from_meta_state()'s TIME-VARYING nature and its
+INFORMED nature (reacting to real coherence) are two different
+properties, and a fixed-vs-trust comparison can't tell which one
+mattered -- FIXED ablates both at once. RANDOM ablates only the informed
+part, keeping the same variability (matched mean AND std, not just
+mean) but with no connection to what's actually happening upstream. If
+RANDOM scores near FIXED's z~=0, that confirms it's the informed judgment
+that matters, not mere variability. If RANDOM scores near TRUST's
+real-but-modest z, that would mean variability alone was doing the work
+and "trust-gated" oversold the mechanism.
 
-Usage: python3 run_ablation.py <depth 1|2|3> <gate trust|fixed> [out_csv]
+Usage: python3 run_ablation.py <depth 1|2|3> <gate trust|fixed|random> [out_csv]
 """
 import csv
 import math
 import multiprocessing
+import random
 import sys
 import time
 
@@ -30,7 +41,7 @@ from cpu_telemetry import CpuTelemetry
 from layer0_oscillator import (Layer0Node, gain_from_deviation,
                                 integrate_interval as integrate_interval_0,
                                 order_parameter)
-from layer1_oscillator import (Layer1Node,
+from layer1_oscillator import (Layer1Node, K1_MAX as K_MAX_CEILING,
                                 gain_from_meta_state as gain_from_meta_state_1,
                                 integrate_interval as integrate_interval_1)
 from layer2_oscillator import (Layer2Node,
@@ -57,10 +68,11 @@ def measure_baseline_target(telem, duration_s=TARGET_MEASURE_S):
     return sum(readings) / len(readings)
 
 
-def measure_fixed_gain_1(telem, nodes, target_load_frac, duration_s=TARGET_MEASURE_S):
+def measure_gain1_stats(telem, nodes, target_load_frac, duration_s=TARGET_MEASURE_S):
     """Runs Layer 0 + real trust-gated Layer 1 for duration_s under calm
-    conditions and returns the mean gain1 it actually produced -- the
-    FIXED condition's constant, calibrated instead of guessed."""
+    conditions and returns (mean, std) of the real gain1 it actually
+    produced -- FIXED uses just the mean; RANDOM uses both, so its
+    sampled gain has matched variability, not just matched average."""
     layer1_node = Layer1Node()
     prev_abs_err1 = 0.0
     delta_abs_err1 = 0.0
@@ -79,12 +91,21 @@ def measure_fixed_gain_1(telem, nodes, target_load_frac, duration_s=TARGET_MEASU
         prev_abs_err1 = abs_err1
         gains_seen.append(gain1)
         time.sleep(REPORT_INTERVAL_S)
-    return sum(gains_seen) / len(gains_seen)
+    mean = sum(gains_seen) / len(gains_seen)
+    var = sum((g - mean) ** 2 for g in gains_seen) / len(gains_seen)
+    return mean, var ** 0.5
+
+
+def random_gain(mean, std):
+    """One independent draw, no dependence on real coherence/anchoring/
+    stability at all -- clipped to a valid gain range [0, K_MAX], same
+    ceiling gain_from_meta_state() itself respects."""
+    return max(0.0, min(K_MAX_CEILING, random.gauss(mean, std)))
 
 
 def run(depth, gate, out_csv):
     assert depth in (1, 2, 3)
-    assert gate in ("trust", "fixed")
+    assert gate in ("trust", "fixed", "random")
 
     telem = CpuTelemetry()
     n_spike_workers = max(1, telem.n_cores // 2)
@@ -98,20 +119,24 @@ def run(depth, gate, out_csv):
     nodes = [Layer0Node(i) for i in range(telem.n_cores)]
 
     fixed_gain1 = fixed_gain2 = None
-    if gate == "fixed" and depth >= 2:
-        print(f"[ablation] calibrating FIXED gain1 from real trust-gated baseline...",
+    random_mean = random_std = None
+    if gate in ("fixed", "random") and depth >= 2:
+        print(f"[ablation] calibrating {gate} gain1 stats from real trust-gated baseline...",
               flush=True)
-        fixed_gain1 = measure_fixed_gain_1(telem, nodes, target_load_frac)
-        print(f"[ablation] FIXED gain1 = {fixed_gain1:.1f}", flush=True)
+        mean1, std1 = measure_gain1_stats(telem, nodes, target_load_frac)
+        print(f"[ablation] gain1 baseline: mean={mean1:.1f} std={std1:.1f}", flush=True)
+        if gate == "fixed":
+            fixed_gain1 = mean1
+        else:
+            random_mean, random_std = mean1, std1
         # Reset nodes -- the calibration run above already moved their
         # phase state, start the real measurement window fresh.
         nodes = [Layer0Node(i) for i in range(telem.n_cores)]
-    if gate == "fixed" and depth >= 3:
-        # Layer 2's fixed gain uses the same calibrated magnitude as
-        # Layer 1's -- both trust gates share the same K_MAX scale and
-        # the same role (gate this level's own forcing), so one
-        # calibrated constant is the fair fixed-gain stand-in for both,
-        # not a second independently-guessed number.
+    if gate in ("fixed", "random") and depth >= 3:
+        # Layer 2 reuses the same calibrated Layer 1 stats -- both gates
+        # share the same K_MAX scale and the same role (gate this
+        # level's own forcing), so one calibration is the fair stand-in
+        # for both, not a second independently-guessed/measured number.
         fixed_gain2 = fixed_gain1
 
     layer1_node = Layer1Node() if depth >= 2 else None
@@ -146,8 +171,12 @@ def run(depth, gate, out_csv):
         output_field = "psi0"
 
         if depth >= 2:
-            gain1 = fixed_gain1 if gate == "fixed" else gain_from_meta_state_1(
-                r0, abs(psi0), delta_abs_err1)
+            if gate == "fixed":
+                gain1 = fixed_gain1
+            elif gate == "random":
+                gain1 = random_gain(random_mean, random_std)
+            else:
+                gain1 = gain_from_meta_state_1(r0, abs(psi0), delta_abs_err1)
             integrate_interval_1(layer1_node, gain1, psi0, REPORT_INTERVAL_S)
             tracking_err1 = ((layer1_node.theta - psi0 + math.pi) % (2 * math.pi)) - math.pi
             abs_err1 = abs(tracking_err1)
@@ -158,8 +187,12 @@ def run(depth, gate, out_csv):
 
         if depth >= 3:
             r1_for_l2 = 1.0  # single in-process Layer1 source, trivially self-coherent
-            gain2 = fixed_gain2 if gate == "fixed" else gain_from_meta_state_2(
-                r1_for_l2, abs(layer1_node.theta), delta_abs_err2)
+            if gate == "fixed":
+                gain2 = fixed_gain2
+            elif gate == "random":
+                gain2 = random_gain(random_mean, random_std)
+            else:
+                gain2 = gain_from_meta_state_2(r1_for_l2, abs(layer1_node.theta), delta_abs_err2)
             integrate_interval_2(layer2_node, gain2, layer1_node.theta, REPORT_INTERVAL_S)
             tracking_err2 = ((layer2_node.theta - layer1_node.theta + math.pi)
                               % (2 * math.pi)) - math.pi
