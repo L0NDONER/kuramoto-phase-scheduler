@@ -32,7 +32,9 @@ down on SIGINT/SIGTERM.
 Run: sudo python3 quartz_wan_gain.py [iface]
 """
 
-import json, math, signal, subprocess, sys, time
+import signal, subprocess, sys, time
+
+from quartz_gain_common import run_gain_loop
 
 IFACE    = sys.argv[1] if len(sys.argv) > 1 else "enp0s31f6"
 TC       = "/usr/sbin/tc"
@@ -71,32 +73,17 @@ def set_rate(mbit):
             "burst", "1500k", "quantum", "1514"])
 
 
-def read_substrate():
-    """Returns (theta, healthy) or (None, False) if substrate is down."""
-    try:
-        mtime = __import__("os").path.getmtime(HEALTH_PATH)
-        if time.time() - mtime > HEALTH_TIMEOUT_S:
-            return None, False
-        theta = None
-        any_healthy = False
-        with open(HEALTH_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                if "self_phase" in d:
-                    theta = d["self_phase"]
-                elif d.get("healthy"):
-                    any_healthy = True
-        if theta is None or not any_healthy:
-            return None, False
-        return theta, True
-    except (FileNotFoundError, OSError):
-        return None, False
+def on_floor():
+    floor_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * G_BASE)
+    set_rate(floor_mbit)
+
+
+def on_locked(theta, carrier, g):
+    step = round(g * N_STEPS)
+    rate_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * step / N_STEPS)
+    set_rate(rate_mbit)
+    print(f"[quartz_wan_gain] theta={theta:.3f} carrier={carrier:.3f} "
+          f"G={g:.3f} -> {rate_mbit}Mbit", flush=True)
 
 
 def main():
@@ -108,55 +95,11 @@ def main():
     signal.signal(signal.SIGTERM, _exit)
     signal.signal(signal.SIGINT, _exit)
 
-    floor_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * G_BASE)
-    floor_step = round(G_BASE * N_STEPS)
-
-    last_step = -1
-    last_locked_t = None
-    last_warn_t = 0.0
-
     print(f"[quartz_wan_gain] {IFACE} {CLASSID}  {RATE_MIN}-{RATE_MAX}Mbit  "
           f"steps={N_STEPS}  G_BASE={G_BASE}", flush=True)
 
-    while True:
-        theta, healthy = read_substrate()
-
-        if not healthy:
-            now = time.time()
-            # Force the floor immediately, not just log about it — freezing
-            # at whatever the last real rate happened to be would "park at
-            # the ceiling" exactly when the design intent says not to.
-            if last_step != floor_step:
-                set_rate(floor_mbit)
-                last_step = floor_step
-                print(f"[quartz_wan_gain] substrate down -> forcing floor {floor_mbit}Mbit", flush=True)
-
-            since = None if last_locked_t is None else now - last_locked_t
-            if since is None or since > SUBSTRATE_WARN_S:
-                if now - last_warn_t > SUBSTRATE_WARN_S:
-                    since_str = "never" if last_locked_t is None else f"{since:.0f}s ago"
-                    print(f"[quartz_wan_gain] SUBSTRATE DOWN -- no healthy peer "
-                          f"(last locked {since_str}), holding at floor", flush=True)
-                    last_warn_t = now
-            time.sleep(POLL_S)
-            continue
-
-        last_locked_t = time.time()
-
-        carrier = (1.0 - math.cos(theta)) / 2.0
-        G_WAN = G_BASE + (1.0 - G_BASE) * carrier
-        G_WAN = max(0.0, min(1.0, G_WAN))
-
-        step = round(G_WAN * N_STEPS)
-        rate_mbit = RATE_MIN + round((RATE_MAX - RATE_MIN) * step / N_STEPS)
-
-        if step != last_step:
-            set_rate(rate_mbit)
-            last_step = step
-            print(f"[quartz_wan_gain] theta={theta:.3f} carrier={carrier:.3f} "
-                  f"G={G_WAN:.3f} -> {rate_mbit}Mbit", flush=True)
-
-        time.sleep(POLL_S)
+    run_gain_loop(G_BASE, N_STEPS, on_locked, on_floor, "quartz_wan_gain",
+                  HEALTH_PATH, HEALTH_TIMEOUT_S, POLL_S, SUBSTRATE_WARN_S)
 
 
 if __name__ == "__main__":

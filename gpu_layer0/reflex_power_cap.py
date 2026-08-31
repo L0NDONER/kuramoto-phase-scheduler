@@ -158,7 +158,7 @@ def main():
                 break
             parsed = parse_report(data)
             if parsed:
-                name, r, _psi, _dt_lag_s = parsed
+                name, r, _psi, _dt_lag_s, _amplitude = parsed
                 if name == "gpu":
                     last_r, last_r_t = r, now
                 elif name == "layer1":

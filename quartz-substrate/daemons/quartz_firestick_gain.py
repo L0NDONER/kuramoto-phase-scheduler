@@ -30,7 +30,9 @@ hot path.
 Run: sudo python3 quartz_firestick_gain.py
 """
 
-import json, math, os, signal, subprocess, sys, time
+import signal, subprocess, sys, time
+
+from quartz_gain_common import run_gain_loop
 
 TC   = "/usr/sbin/tc"
 IFACE = "eth0"
@@ -62,36 +64,18 @@ def set_rate(classid, mbit):
                     check=True)
 
 
-def read_substrate():
-    try:
-        mtime = os.path.getmtime(HEALTH_PATH)
-        if time.time() - mtime > HEALTH_TIMEOUT_S:
-            return None, False
-        theta = None
-        any_healthy = False
-        with open(HEALTH_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                if "self_phase" in d:
-                    theta = d["self_phase"]
-                elif d.get("healthy"):
-                    any_healthy = True
-        if theta is None or not any_healthy:
-            return None, False
-        return theta, True
-    except (FileNotFoundError, OSError):
-        return None, False
-
-
 def apply_gain(G):
     for classid, (base, _label) in BASE_RATES.items():
         set_rate(classid, base * G)
+
+
+def on_floor():
+    apply_gain(G_BASE)
+
+
+def on_locked(theta, carrier, g):
+    apply_gain(g)
+    print(f"[quartz_firestick_gain] theta={theta:.3f} carrier={carrier:.3f} G={g:.3f}", flush=True)
 
 
 def main():
@@ -112,46 +96,12 @@ def main():
     signal.signal(signal.SIGTERM, _exit)
     signal.signal(signal.SIGINT, _exit)
 
-    last_g_step = -1
-    last_locked_t = None
-    last_warn_t = 0.0
     G_STEPS = 16
 
     print(f"[quartz_firestick_gain] {IFACE}  {len(BASE_RATES)} classes  G_BASE={G_BASE}", flush=True)
 
-    while True:
-        theta, healthy = read_substrate()
-
-        if not healthy:
-            now = time.time()
-            if last_g_step != round(G_BASE * G_STEPS):
-                apply_gain(G_BASE)
-                last_g_step = round(G_BASE * G_STEPS)
-                print(f"[quartz_firestick_gain] substrate down -> forcing floor G={G_BASE}", flush=True)
-
-            since = None if last_locked_t is None else now - last_locked_t
-            if since is None or since > SUBSTRATE_WARN_S:
-                if now - last_warn_t > SUBSTRATE_WARN_S:
-                    since_str = "never" if last_locked_t is None else f"{since:.0f}s ago"
-                    print(f"[quartz_firestick_gain] SUBSTRATE DOWN -- no healthy peer "
-                          f"(last locked {since_str}), holding at floor", flush=True)
-                    last_warn_t = now
-            time.sleep(POLL_S)
-            continue
-
-        last_locked_t = time.time()
-
-        carrier = (1.0 - math.cos(theta)) / 2.0
-        G = G_BASE + (1.0 - G_BASE) * carrier
-        G = max(0.0, min(1.0, G))
-
-        step = round(G * G_STEPS)
-        if step != last_g_step:
-            apply_gain(G)
-            last_g_step = step
-            print(f"[quartz_firestick_gain] theta={theta:.3f} carrier={carrier:.3f} G={G:.3f}", flush=True)
-
-        time.sleep(POLL_S)
+    run_gain_loop(G_BASE, G_STEPS, on_locked, on_floor, "quartz_firestick_gain",
+                  HEALTH_PATH, HEALTH_TIMEOUT_S, POLL_S, SUBSTRATE_WARN_S)
 
 
 if __name__ == "__main__":

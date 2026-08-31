@@ -50,7 +50,7 @@ def main():
             data, _addr = sock.recvfrom(64)
             parsed = parse_report(data)
             if parsed and parsed[0] != SELF_NAME:
-                name, r, psi, _dt_lag_s = parsed
+                name, r, psi, _dt_lag_s, _amplitude = parsed
                 last_seen[name] = (r, psi, now)
         except BlockingIOError:
             pass

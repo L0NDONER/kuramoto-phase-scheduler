@@ -5,7 +5,17 @@ protocol (`phase_auth.py` / `phase_auth_prover.py`) that rides on it.
 No stored secrets anywhere in this package — every credential here is
 "I can currently observe the same physical oscillator you can."
 
-Status: **research/demo lane**, not production. See [Production gaps](#production-gaps).
+Status: **load-bearing, not deployed.** The auth protocol here is not
+throwaway research code — `phase_auth.gate_check` is imported as the
+real auth gate by `pi1_node.py`, `pi2_node.py`, `mint_node.py`,
+`ec2_relay.py`, `cascade_pll/channels/ec2_intent_send.py`, and four
+files under `glyph/` (`glyph_tx.py`, `glyph_intent.py`,
+`jitter_wan_tx.py`, `tick_print.py`). Don't delete this package without
+checking those callers first (nearly happened 2026-08-30). Separately,
+and still true: no `quartz_beacon.py` carrier is currently running
+anywhere (verified live on Mint/pi/pi2, 2026-08-30), so `gate_check()`
+has nothing to observe and cannot currently PASS — see [Production
+gaps](#production-gaps) and [Known caveats](#known-caveats).
 
 ## Files
 
@@ -303,8 +313,10 @@ covered so far, not a systematic matrix.
 
 ## Production gaps
 
-This package is deliberately staying in the research/demo lane. If it
-ever needs to gate something real, it needs, in order:
+Real callers already import `gate_check` (see [Status](#quartz_core)
+above), but no carrier is currently deployed for it to check against,
+so today it can only ever fail closed. Before deploying a carrier and
+making this gate actually enforce something live, it needs, in order:
 
 1. **mTLS on top** — phase-auth demoted from "the credential" to an
    attestation signal layered onto an already-authenticated channel,
