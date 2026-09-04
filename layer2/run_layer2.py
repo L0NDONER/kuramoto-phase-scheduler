@@ -93,7 +93,7 @@ def _drain_reports(in_sock, deadline, latest, last_seen):
         parsed = parse_report(data)
         if parsed is None:
             continue
-        name, r, psi, _dt_lag_s = parsed
+        name, r, psi, _dt_lag_s, _amplitude = parsed
         if name != "layer1":
             continue
         latest[name] = (r, psi)

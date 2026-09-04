@@ -31,8 +31,8 @@ Usage:
 """
 import random, socket, struct, sys, time
 sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
-from quartz_core.phase_auth import gate_check
-sys.path.insert(0, __import__("os").path.dirname(__file__))
+from quartz_core.i0_phase_auth import gate_check
+sys.path.insert(0, "/home/martin/claude/cascade_pll/channels")
 from ec2_intent_common import load_key, unpack_response, DONE_OK
 
 EC2_WG_IP = "10.8.0.1"

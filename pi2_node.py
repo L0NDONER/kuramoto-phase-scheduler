@@ -2,7 +2,7 @@
 # Pi2 — thermal reply (sid=2)
 import selectors, socket, struct, sys, time
 
-from quartz_core import phase_auth
+from quartz_core import i0_phase_auth as phase_auth
 
 RAW_GRP, RAW_PORT = "239.0.0.1", 7400
 RAW_MAGIC = 0x1B4A

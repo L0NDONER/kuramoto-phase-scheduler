@@ -30,5 +30,14 @@ memory/
 *.csv
 *.png
 *.log
-organism.bio
 fractal_layer1/logs/
+
+# secrets
+*.key
+
+# virtualenvs
+venv/
+**/venv/
+
+# regeneratable sim output
+grid_twin/data/results.sqlite

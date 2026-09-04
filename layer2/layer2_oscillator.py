@@ -27,7 +27,14 @@ OMEGA2 = 2 * math.pi / 0.03   # same 30ms carrier period as Layer 0/1's,
                                # own instance -- see layer1_oscillator.py's
                                # note on why these stay equal for now
 
-K2_MAX = 8000.0                # same scale as Layer 0/1's K_MAX/K1_MAX
+K2_MAX = 8000.0                # same scale as Layer 0/1's K_MAX/K1_MAX --
+                                # matched ceiling makes Layer 2 a verifier
+                                # (tight mirror of Layer 1, catches drift)
+                                # rather than a filter. Dropping to 800
+                                # 2026-08-17 confirmed a real damping stage
+                                # is possible (tracking_err2 mean/std both
+                                # grew ~10x/36x) but that's a different job
+                                # than verification -- reverted for now.
 
 # Same K*dt<~2.8 (RK4 linear stability) and dt<<1/K reasoning as
 # layer0_oscillator.py / layer1_oscillator.py -- sizing dt off K2_MAX

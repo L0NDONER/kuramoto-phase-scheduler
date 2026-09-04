@@ -10,7 +10,7 @@ Usage:
 """
 import socket, struct, sys, time
 sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
-from quartz_core.phase_auth import gate_check
+from quartz_core.i0_phase_auth import gate_check
 
 READER_IP  = "127.0.0.1"
 GLYPH_PORT = 7408

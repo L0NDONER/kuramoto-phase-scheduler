@@ -27,6 +27,18 @@ well-defined tracking error, so Layer 0 senders leave this NaN (see
 send_report's default) rather than reporting a fabricated number.
 Receivers that don't care can ignore it same as they'd ignore any other
 field; receivers that do care must check math.isnan() before using it.
+
+amplitude, added 2026-08-18: report-only, same NaN-default convention as
+dt_lag_s -- see market_layer0/amplitude_probe.py, a sandboxed Stuart-
+Landau probe validated over a real 9-hour run (A_FLOOR fix confirmed
+holding across every hour, real decay/recovery cycles throughout).
+Deliberately NOT wired into order_parameter() anywhere -- adding the
+field to the wire is step one of the two-step promotion this repo's
+signal-vs-actuation boundary requires; nothing downstream reads or acts
+on it yet. No sender currently populates it (amplitude_probe.py itself
+still isn't wired onto this multicast wire, still fully sandboxed) --
+this just makes the wire format capable of carrying it when/if that
+changes.
 """
 import socket
 import struct
@@ -34,7 +46,7 @@ import struct
 GRP = "239.0.0.6"
 PORT = 7460
 MAGIC = 0x4C30   # "L0"
-FMT = "!HBfff"   # magic, node_id, r, psi, dt_lag_s
+FMT = "!HBffff"   # magic, node_id, r, psi, dt_lag_s, amplitude
 SIZE = struct.calcsize(FMT)
 
 # Fixed small registry, not a general discovery protocol -- matches this
@@ -43,7 +55,7 @@ SIZE = struct.calcsize(FMT)
 # the same wire format/port a Layer 0 node uses -- the recursive structure
 # continuing one level up, not a special case: whatever subscribes to a
 # Layer 0 report can subscribe to Layer 1's the same way.
-NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4, "layer1": 5, "market": 6, "layer2": 7}
+NODE_IDS = {"mint": 1, "pi2": 2, "pi1": 3, "gpu": 4, "layer1": 5, "market": 6, "layer2": 7, "netlat": 8, "gridfreq": 9}
 NODE_NAMES = {v: k for k, v in NODE_IDS.items()}
 
 
@@ -64,22 +76,23 @@ def mcast_in():
     return s
 
 
-def send_report(sock, node_name, r, psi, dt_lag_s=float("nan")):
+def send_report(sock, node_name, r, psi, dt_lag_s=float("nan"), amplitude=float("nan")):
     node_id = NODE_IDS[node_name]
-    pkt = struct.pack(FMT, MAGIC, node_id, r, psi, dt_lag_s)
+    pkt = struct.pack(FMT, MAGIC, node_id, r, psi, dt_lag_s, amplitude)
     sock.sendto(pkt, (GRP, PORT))
 
 
 def parse_report(data):
-    """Returns (node_name, r, psi, dt_lag_s) or None if not a valid
-    report packet. dt_lag_s is NaN for senders that don't track a single
-    target (see module docstring) -- check math.isnan() before using it."""
+    """Returns (node_name, r, psi, dt_lag_s, amplitude) or None if not a
+    valid report packet. dt_lag_s and amplitude are both NaN for senders
+    that don't report them (see module docstring) -- check
+    math.isnan() before using either."""
     if len(data) < SIZE:
         return None
-    magic, node_id, r, psi, dt_lag_s = struct.unpack_from(FMT, data)
+    magic, node_id, r, psi, dt_lag_s, amplitude = struct.unpack_from(FMT, data)
     if magic != MAGIC:
         return None
     name = NODE_NAMES.get(node_id)
     if name is None:
         return None
-    return name, r, psi, dt_lag_s
+    return name, r, psi, dt_lag_s, amplitude

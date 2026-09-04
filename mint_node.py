@@ -2,7 +2,7 @@
 # Mint — WAN shaper + final commit
 import hashlib, math, selectors, socket, struct, sys, time
 
-from quartz_core import phase_auth
+from quartz_core import i0_phase_auth as phase_auth
 import ns_wan_gain as nwg
 
 RAW_GRP, RAW_PORT = "239.0.0.1", 7400

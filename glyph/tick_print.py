@@ -9,7 +9,7 @@ stalls the wait too instead of firing on a dead substrate.
 """
 import selectors, socket, struct, sys, time
 sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
-from quartz_core.phase_auth import gate_check
+from quartz_core.i0_phase_auth import gate_check
 
 RAW_GRP, RAW_PORT = "239.0.0.1", 7400
 RAW_FMT = "!HBIffBQ"; RAW_MAGIC = 0x1B4A
