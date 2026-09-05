@@ -50,7 +50,7 @@
 
 static const struct { const char *name; const char *ip; } HOSTS[] = {
     { "mint", "10.0.0.71"  },
-    { "lmde", "10.0.0.175" },
+    { "pi1",  "10.0.0.122" },
 };
 
 /* Forward-cone admissibility: a tick is admitted only if its measured
